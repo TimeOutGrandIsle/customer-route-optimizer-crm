@@ -98,6 +98,12 @@ if uploaded_file:
             st.error("Need at least 2 locations.")
             st.stop()
 
+def solve_route(locations, time_matrix, day_start, day_end):
+    return {
+        "route": locations,
+        "total_time": 0
+    }
+
         st.success(f"✅ Geocoded {len(locations)} locations")
 
         # Build Time Matrix (driving + service time)
