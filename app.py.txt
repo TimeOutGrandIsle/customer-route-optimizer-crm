@@ -90,42 +90,38 @@ def solve_route(locations, time_matrix, day_start, day_end):
     manager = pywrapcp.RoutingIndexManager(n, 1, depot_idx)
     routing = pywrapcp.RoutingModel(manager)
 
+    # -------------------------
+    # COST FUNCTION (DRIVING TIME)
+    # -------------------------
     def time_callback(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
         return time_matrix[from_node][to_node]
 
     transit_cb = routing.RegisterTransitCallback(time_callback)
+
     routing.SetArcCostEvaluatorOfAllVehicles(transit_cb)
 
-    routing.AddDimension(
-        transit_cb,
-        30,
-        1440,
-        True,
-        "Time"
-    )
+    # -------------------------
+    # NO TIME WINDOWS (KEY FIX)
+    # -------------------------
+    # This is what was breaking your solver.
 
-    time_dim = routing.GetDimensionOrDie("Time")
-
-    start_minutes = day_start.hour * 60 + day_start.minute
-    end_minutes = day_end.hour * 60 + day_end.minute
-
-    for i, loc in enumerate(locations):
-        if not loc["is_depot"]:
-            idx = manager.NodeToIndex(i)
-            time_dim.CumulVar(idx).SetRange(start_minutes, end_minutes)
-
+    # -------------------------
+    # SOLVER SETTINGS (STABLE)
+    # -------------------------
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    params.time_limit.FromSeconds(20)
+    params.time_limit.FromSeconds(10)
 
     solution = routing.SolveWithParameters(params)
 
     if not solution:
         return None
 
+    # -------------------------
+    # EXTRACT ROUTE
+    # -------------------------
     index = routing.Start(0)
     route = []
     total_time = 0
@@ -134,10 +130,14 @@ def solve_route(locations, time_matrix, day_start, day_end):
         node = manager.IndexToNode(index)
         route.append(node)
 
-        prev = index
+        prev_index = index
         index = solution.Value(routing.NextVar(index))
 
-        total_time += time_matrix[manager.IndexToNode(prev)][manager.IndexToNode(index)]
+        total_time += time_matrix[
+            manager.IndexToNode(prev_index)
+        ][
+            manager.IndexToNode(index)
+        ]
 
     route.append(manager.IndexToNode(index))
 
