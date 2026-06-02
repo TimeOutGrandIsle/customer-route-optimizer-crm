@@ -10,6 +10,28 @@ import folium
 from streamlit_folium import st_folium
 from math import radians, sin, cos, sqrt, atan2
 
+from math import radians, sin, cos, sqrt, atan2
+
+def haversine_distance(coord1, coord2):
+    R = 6371  # Earth radius in kilometers
+
+    lat1, lon1 = coord1
+    lat2, lon2 = coord2
+
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+
+    a = (
+        sin(dlat / 2) ** 2
+        + cos(radians(lat1))
+        * cos(radians(lat2))
+        * sin(dlon / 2) ** 2
+    )
+
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+
+    return R * c
+
 st.set_page_config(page_title="Route Optimizer", page_icon="🚚", layout="wide")
 
 st.title("🚚 Advanced Customer Route Optimizer")
