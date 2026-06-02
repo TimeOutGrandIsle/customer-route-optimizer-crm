@@ -230,8 +230,17 @@ if uploaded_file:
         st.success(f"Geocoded {len(locations)} locations")
 
         if failed:
-            st.warning(f"{len(failed)} addresses failed geocoding")
+    st.warning(f"{len(failed)} addresses failed geocoding: {len(failed)}")
 
+    with st.expander("📍 View failed addresses"):
+        st.write(failed)
+
+    st.download_button(
+        "Download Failed Addresses",
+        pd.DataFrame(failed, columns=["address"]).to_csv(index=False),
+        "failed_geocodes.csv",
+        "text/csv"
+    )
         if len(locations) < 2:
             st.error("Not enough valid locations to build a route.")
             st.stop()
