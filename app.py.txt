@@ -8,24 +8,27 @@ import os
 
 from geopy.geocoders import Nominatim
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+from urllib.parse import quote
 import folium
 from streamlit_folium import st_folium
 from math import radians, sin, cos, sqrt, atan2
 
 
 # =========================
-# CONFIG
+# APP CONFIG
 # =========================
 st.set_page_config(page_title="Route Optimizer", page_icon="🚚", layout="wide")
 
-st.title("🚚 Customer Route Optimizer (Stable Free Version)")
-st.markdown("Geocoding + OR-Tools + caching + Google Maps export")
+st.title("🚚 Lawn Care Route Optimizer (Stable Free Version)")
+st.markdown("Optimized routing + caching + Google Maps export")
 
 SERVICE_TIME_MIN = 30
-
 CACHE_FILE = "geocode_cache.json"
 
-# Load cache
+
+# =========================
+# LOAD CACHE
+# =========================
 if os.path.exists(CACHE_FILE):
     with open(CACHE_FILE, "r") as f:
         GEO_CACHE = json.load(f)
@@ -34,7 +37,7 @@ else:
 
 
 # =========================
-# GEOCODING (CACHE + SAFE)
+# GEOCODING (FREE + CACHED)
 # =========================
 def geocode_address(geolocator, address):
     if address in GEO_CACHE:
@@ -44,11 +47,7 @@ def geocode_address(geolocator, address):
         loc = geolocator.geocode(address, timeout=10)
 
         if loc:
-            result = {
-                "lat": loc.latitude,
-                "lon": loc.longitude
-            }
-
+            result = {"lat": loc.latitude, "lon": loc.longitude}
             GEO_CACHE[address] = result
 
             with open(CACHE_FILE, "w") as f:
@@ -63,7 +62,7 @@ def geocode_address(geolocator, address):
 
 
 # =========================
-# DISTANCE (FALLBACK)
+# DISTANCE FALLBACK
 # =========================
 def haversine_distance(loc1, loc2):
     R = 6371.0
@@ -81,35 +80,24 @@ def haversine_distance(loc1, loc2):
 
 
 # =========================
-# ROUTE SOLVER (OR-TOOLS)
+# ROUTE SOLVER (STABLE)
 # =========================
-def solve_route(locations, time_matrix, day_start, day_end):
+def solve_route(locations, time_matrix):
     n = len(locations)
-    depot_idx = 0
+    depot = 0
 
-    manager = pywrapcp.RoutingIndexManager(n, 1, depot_idx)
+    manager = pywrapcp.RoutingIndexManager(n, 1, depot)
     routing = pywrapcp.RoutingModel(manager)
 
-    # -------------------------
-    # COST FUNCTION (DRIVING TIME)
-    # -------------------------
-    def time_callback(from_index, to_index):
+    def callback(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
         return time_matrix[from_node][to_node]
 
-    transit_cb = routing.RegisterTransitCallback(time_callback)
+    transit = routing.RegisterTransitCallback(callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit)
 
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_cb)
-
-    # -------------------------
-    # NO TIME WINDOWS (KEY FIX)
-    # -------------------------
-    # This is what was breaking your solver.
-
-    # -------------------------
-    # SOLVER SETTINGS (STABLE)
-    # -------------------------
+    # SIMPLE + STABLE SOLVER SETTINGS
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     params.time_limit.FromSeconds(10)
@@ -119,64 +107,62 @@ def solve_route(locations, time_matrix, day_start, day_end):
     if not solution:
         return None
 
-    # -------------------------
-    # EXTRACT ROUTE
-    # -------------------------
     index = routing.Start(0)
     route = []
-    total_time = 0
+    total = 0
 
     while not routing.IsEnd(index):
         node = manager.IndexToNode(index)
         route.append(node)
 
-        prev_index = index
+        prev = index
         index = solution.Value(routing.NextVar(index))
 
-        total_time += time_matrix[
-            manager.IndexToNode(prev_index)
+        total += time_matrix[
+            manager.IndexToNode(prev)
         ][
             manager.IndexToNode(index)
         ]
 
     route.append(manager.IndexToNode(index))
 
-    return {
-        "route": route,
-        "total_time": total_time
-    }
+    return {"route": route, "total_time": total}
 
 
 # =========================
-# GOOGLE MAPS
+# GOOGLE MAPS LINK
 # =========================
 def create_google_maps_url(addresses):
     if len(addresses) < 2:
         return "#"
 
-    origin = addresses[0].replace(" ", "+")
-    dest = addresses[-1].replace(" ", "+")
+    origin = quote(addresses[0])
+    destination = quote(addresses[-1])
+    waypoints = "|".join(quote(a) for a in addresses[1:-1])
 
-    waypoints = "|".join(a.replace(" ", "+") for a in addresses[1:-1])
+    url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={destination}"
 
-    return f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={dest}&waypoints={waypoints}&travelmode=driving"
+    if waypoints:
+        url += f"&waypoints={waypoints}"
+
+    return url + "&travelmode=driving"
 
 
 # =========================
-# MAP
+# MAP DISPLAY
 # =========================
-def create_folium_map(route_locs):
+def create_map(route_locs):
     m = folium.Map(location=[route_locs[0]["lat"], route_locs[0]["lon"]], zoom_start=11)
 
     for i, loc in enumerate(route_locs):
         folium.Marker(
             [loc["lat"], loc["lon"]],
-            popup=f"Stop {i+1}: {loc['address']}",
+            popup=f"{i+1}. {loc['address']}",
             icon=folium.Icon(color="red" if i == 0 else "blue")
         ).add_to(m)
 
     folium.PolyLine([[l["lat"], l["lon"]] for l in route_locs],
-                    color="blue", weight=4).add_to(m)
+                    weight=4).add_to(m)
 
     return m
 
@@ -193,12 +179,6 @@ if uploaded_file:
     st.dataframe(df)
 
     address_col = st.selectbox("Address Column", df.columns)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        day_start = st.time_input("Start Time", value=pd.to_datetime("08:00").time())
-    with col2:
-        day_end = st.time_input("End Time", value=pd.to_datetime("17:00").time())
 
     depot_address = st.text_input("Depot Address (optional)")
 
@@ -236,7 +216,7 @@ if uploaded_file:
                     "is_depot": False
                 })
 
-            time.sleep(0.5)  # safe rate limiting
+            time.sleep(0.5)
 
         if len(locations) < 2:
             st.error("Need at least 2 valid locations")
@@ -250,10 +230,9 @@ if uploaded_file:
         n = len(locations)
         time_matrix = np.zeros((n, n), dtype=int)
 
-        with st.spinner("Building travel matrix..."):
+        with st.spinner("Building route..."):
             for i in range(n):
                 for j in range(n):
-
                     if i == j:
                         continue
 
@@ -269,13 +248,12 @@ if uploaded_file:
                         time_matrix[i][j] = int(dist * 2) + SERVICE_TIME_MIN
 
         # =====================
-        # SOLVE ROUTE
+        # SOLVE
         # =====================
-        with st.spinner("Optimizing route..."):
-            solution = solve_route(locations, time_matrix, day_start, day_end)
+        solution = solve_route(locations, time_matrix)
 
         if not solution:
-            st.error("No feasible route found")
+            st.error("No route found")
             st.stop()
 
         route = solution["route"]
@@ -293,14 +271,23 @@ if uploaded_file:
 
         st.metric("Total Time (min)", solution["total_time"])
 
-        # Google Maps
-        maps_url = create_google_maps_url([locations[i]["address"] for i in route])
+        # =====================
+        # GOOGLE MAPS
+        # =====================
+        addresses = [locations[i]["address"] for i in route]
+        maps_url = create_google_maps_url(addresses)
+
+        st.markdown("### 🚗 Google Maps Route")
         st.markdown(f"[Open in Google Maps]({maps_url})")
 
-        # Map
-        st_folium(create_folium_map([locations[i] for i in route]), width=800)
+        # =====================
+        # MAP
+        # =====================
+        st_folium(create_map([locations[i] for i in route]), width=800)
 
-        # Download
+        # =====================
+        # DOWNLOAD
+        # =====================
         st.download_button(
             "Download Route CSV",
             route_df.to_csv(index=False),
