@@ -15,12 +15,12 @@ from math import radians, sin, cos, sqrt, atan2
 
 
 # =========================
-# APP CONFIG
+# CONFIG
 # =========================
 st.set_page_config(page_title="Route Optimizer", page_icon="🚚", layout="wide")
 
-st.title("🚚 Lawn Care Route Optimizer (Stable Free Version)")
-st.markdown("Optimized routing + caching + Google Maps export")
+st.title("🚚 Lawn Care Route Optimizer (Stable Production Version)")
+st.markdown("Free routing tool with caching + fallback + Google Maps export")
 
 SERVICE_TIME_MIN = 30
 CACHE_FILE = "geocode_cache.json"
@@ -37,7 +37,7 @@ else:
 
 
 # =========================
-# GEOCODING (FREE + CACHED)
+# GEOCODER (CACHED + SAFE)
 # =========================
 def geocode_address(geolocator, address):
     if address in GEO_CACHE:
@@ -97,7 +97,7 @@ def solve_route(locations, time_matrix):
     transit = routing.RegisterTransitCallback(callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit)
 
-    # SIMPLE + STABLE SOLVER SETTINGS
+    # SIMPLE SOLVER (NO CONSTRAINTS = NO FAILURES)
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     params.time_limit.FromSeconds(10)
@@ -130,11 +130,11 @@ def solve_route(locations, time_matrix):
 
 
 # =========================
-# GOOGLE MAPS LINK
+# GOOGLE MAPS EXPORT
 # =========================
 def create_google_maps_url(addresses):
-    if len(addresses) < 2:
-        return "#"
+    if not addresses or len(addresses) < 2:
+        return None
 
     origin = quote(addresses[0])
     destination = quote(addresses[-1])
@@ -149,7 +149,7 @@ def create_google_maps_url(addresses):
 
 
 # =========================
-# MAP DISPLAY
+# MAP
 # =========================
 def create_map(route_locs):
     m = folium.Map(location=[route_locs[0]["lat"], route_locs[0]["lon"]], zoom_start=11)
@@ -182,16 +182,23 @@ if uploaded_file:
 
     depot_address = st.text_input("Depot Address (optional)")
 
-    if st.button("Optimize Route"):
+    run = st.button("🚀 Generate Route")
+
+    if run:
 
         geolocator = Nominatim(user_agent="route_optimizer", timeout=10)
+
         locations = []
+        failed = []
+
+        st.info("Geocoding addresses...")
 
         # =====================
         # DEPOT
         # =====================
-        if depot_address:
+        if depot_address.strip():
             geo = geocode_address(geolocator, depot_address)
+
             if geo:
                 locations.append({
                     "address": depot_address,
@@ -215,30 +222,36 @@ if uploaded_file:
                     "lon": geo["lon"],
                     "is_depot": False
                 })
+            else:
+                failed.append(addr)
 
-            time.sleep(0.5)
-
-        if len(locations) < 2:
-            st.error("Need at least 2 valid locations")
-            st.stop()
+            time.sleep(0.3)
 
         st.success(f"Geocoded {len(locations)} locations")
 
+        if failed:
+            st.warning(f"{len(failed)} addresses failed geocoding")
+
+        if len(locations) < 2:
+            st.error("Not enough valid locations to build a route.")
+            st.stop()
+
         # =====================
-        # TIME MATRIX
+        # MATRIX
         # =====================
         n = len(locations)
         time_matrix = np.zeros((n, n), dtype=int)
 
-        with st.spinner("Building route..."):
+        with st.spinner("Building travel matrix..."):
             for i in range(n):
                 for j in range(n):
+
                     if i == j:
                         continue
 
                     try:
                         url = f"http://router.project-osrm.org/route/v1/driving/{locations[i]['lon']},{locations[i]['lat']};{locations[j]['lon']},{locations[j]['lat']}?overview=false"
-                        r = requests.get(url, timeout=8).json()
+                        r = requests.get(url, timeout=6).json()
 
                         duration = r["routes"][0]["duration"] / 60
                         time_matrix[i][j] = int(duration) + SERVICE_TIME_MIN
@@ -250,14 +263,25 @@ if uploaded_file:
         # =====================
         # SOLVE
         # =====================
-        solution = solve_route(locations, time_matrix)
+        with st.spinner("Optimizing route..."):
+            solution = solve_route(locations, time_matrix)
 
         if not solution:
-            st.error("No route found")
-            st.stop()
+            st.warning("Solver failed — using simple fallback route")
+            route = list(range(len(locations)))
+            total_time = 0
+        else:
+            route = solution["route"]
+            total_time = solution["total_time"]
 
-        route = solution["route"]
+        # =====================
+        # CLEAN ROUTE
+        # =====================
+        route = [i for i in route if i < len(locations)]
 
+        # =====================
+        # OUTPUT
+        # =====================
         route_df = pd.DataFrame([
             {
                 "Stop": i + 1,
@@ -266,19 +290,23 @@ if uploaded_file:
             for i, idx in enumerate(route)
         ])
 
-        st.subheader("Optimized Route")
+        st.subheader("📍 Optimized Route")
         st.dataframe(route_df)
 
-        st.metric("Total Time (min)", solution["total_time"])
+        st.metric("Total Time (min)", total_time)
 
         # =====================
-        # GOOGLE MAPS
+        # GOOGLE MAPS (ALWAYS)
         # =====================
         addresses = [locations[i]["address"] for i in route]
         maps_url = create_google_maps_url(addresses)
 
-        st.markdown("### 🚗 Google Maps Route")
-        st.markdown(f"[Open in Google Maps]({maps_url})")
+        st.subheader("🚗 Google Maps Export")
+
+        if maps_url:
+            st.markdown(f"[Open Route in Google Maps]({maps_url})")
+        else:
+            st.warning("Could not generate Google Maps link")
 
         # =====================
         # MAP
