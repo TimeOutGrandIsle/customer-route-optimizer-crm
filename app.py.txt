@@ -1,30 +1,73 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from geopy.geocoders import Nominatim
 import requests
 import time
+import json
+import os
+
+from geopy.geocoders import Nominatim
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import folium
 from streamlit_folium import st_folium
 from math import radians, sin, cos, sqrt, atan2
+
 
 # =========================
 # CONFIG
 # =========================
 st.set_page_config(page_title="Route Optimizer", page_icon="🚚", layout="wide")
 
-st.title("🚚 Advanced Customer Route Optimizer")
-st.markdown("Optimized routing with OR-Tools + time windows + Google Maps export")
+st.title("🚚 Customer Route Optimizer (Stable Free Version)")
+st.markdown("Geocoding + OR-Tools + caching + Google Maps export")
 
 SERVICE_TIME_MIN = 30
 
+CACHE_FILE = "geocode_cache.json"
+
+# Load cache
+if os.path.exists(CACHE_FILE):
+    with open(CACHE_FILE, "r") as f:
+        GEO_CACHE = json.load(f)
+else:
+    GEO_CACHE = {}
+
 
 # =========================
-# HELPERS
+# GEOCODING (CACHE + SAFE)
+# =========================
+def geocode_address(geolocator, address):
+    if address in GEO_CACHE:
+        return GEO_CACHE[address]
+
+    try:
+        loc = geolocator.geocode(address, timeout=10)
+
+        if loc:
+            result = {
+                "lat": loc.latitude,
+                "lon": loc.longitude
+            }
+
+            GEO_CACHE[address] = result
+
+            with open(CACHE_FILE, "w") as f:
+                json.dump(GEO_CACHE, f)
+
+            return result
+
+    except Exception:
+        return None
+
+    return None
+
+
+# =========================
+# DISTANCE (FALLBACK)
 # =========================
 def haversine_distance(loc1, loc2):
     R = 6371.0
+
     lat1, lon1 = loc1["lat"], loc1["lon"]
     lat2, lon2 = loc2["lat"], loc2["lon"]
 
@@ -35,34 +78,6 @@ def haversine_distance(loc1, loc2):
     c = 2 * atan2(sqrt(a), sqrt(1-a))
 
     return R * c
-
-
-def create_google_maps_url(addresses):
-    if len(addresses) < 2:
-        return "#"
-
-    origin = addresses[0].replace(" ", "+")
-    dest = addresses[-1].replace(" ", "+")
-
-    waypoints = "|".join(a.replace(" ", "+") for a in addresses[1:-1])
-
-    return f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={dest}&waypoints={waypoints}&travelmode=driving"
-
-
-def create_folium_map(route_locs):
-    m = folium.Map(location=[route_locs[0]["lat"], route_locs[0]["lon"]], zoom_start=11)
-
-    for i, loc in enumerate(route_locs):
-        folium.Marker(
-            [loc["lat"], loc["lon"]],
-            popup=f"Stop {i+1}: {loc['address']}",
-            icon=folium.Icon(color="red" if i == 0 else "blue")
-        ).add_to(m)
-
-    folium.PolyLine([[l["lat"], l["lon"]] for l in route_locs],
-                    color="blue", weight=4).add_to(m)
-
-    return m
 
 
 # =========================
@@ -83,11 +98,10 @@ def solve_route(locations, time_matrix, day_start, day_end):
     transit_cb = routing.RegisterTransitCallback(time_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_cb)
 
-    # Time dimension
     routing.AddDimension(
         transit_cb,
-        30,      # slack
-        1440,    # max minutes per day
+        30,
+        1440,
         True,
         "Time"
     )
@@ -97,7 +111,6 @@ def solve_route(locations, time_matrix, day_start, day_end):
     start_minutes = day_start.hour * 60 + day_start.minute
     end_minutes = day_end.hour * 60 + day_end.minute
 
-    # Apply time windows (soft but effective constraint)
     for i, loc in enumerate(locations):
         if not loc["is_depot"]:
             idx = manager.NodeToIndex(i)
@@ -135,6 +148,40 @@ def solve_route(locations, time_matrix, day_start, day_end):
 
 
 # =========================
+# GOOGLE MAPS
+# =========================
+def create_google_maps_url(addresses):
+    if len(addresses) < 2:
+        return "#"
+
+    origin = addresses[0].replace(" ", "+")
+    dest = addresses[-1].replace(" ", "+")
+
+    waypoints = "|".join(a.replace(" ", "+") for a in addresses[1:-1])
+
+    return f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={dest}&waypoints={waypoints}&travelmode=driving"
+
+
+# =========================
+# MAP
+# =========================
+def create_folium_map(route_locs):
+    m = folium.Map(location=[route_locs[0]["lat"], route_locs[0]["lon"]], zoom_start=11)
+
+    for i, loc in enumerate(route_locs):
+        folium.Marker(
+            [loc["lat"], loc["lon"]],
+            popup=f"Stop {i+1}: {loc['address']}",
+            icon=folium.Icon(color="red" if i == 0 else "blue")
+        ).add_to(m)
+
+    folium.PolyLine([[l["lat"], l["lon"]] for l in route_locs],
+                    color="blue", weight=4).add_to(m)
+
+    return m
+
+
+# =========================
 # UI
 # =========================
 uploaded_file = st.file_uploader("Upload Excel file", type=["xlsx", "xls"])
@@ -149,40 +196,47 @@ if uploaded_file:
 
     col1, col2 = st.columns(2)
     with col1:
-        day_start = st.time_input("Start", value=pd.to_datetime("08:00").time())
+        day_start = st.time_input("Start Time", value=pd.to_datetime("08:00").time())
     with col2:
-        day_end = st.time_input("End", value=pd.to_datetime("17:00").time())
+        day_end = st.time_input("End Time", value=pd.to_datetime("17:00").time())
 
     depot_address = st.text_input("Depot Address (optional)")
 
     if st.button("Optimize Route"):
 
-        geolocator = Nominatim(user_agent="route_optimizer")
+        geolocator = Nominatim(user_agent="route_optimizer", timeout=10)
         locations = []
 
-        # Depot
+        # =====================
+        # DEPOT
+        # =====================
         if depot_address:
-            loc = geolocator.geocode(depot_address)
-            if loc:
+            geo = geocode_address(geolocator, depot_address)
+            if geo:
                 locations.append({
                     "address": depot_address,
-                    "lat": loc.latitude,
-                    "lon": loc.longitude,
+                    "lat": geo["lat"],
+                    "lon": geo["lon"],
                     "is_depot": True
                 })
 
-        # Customers
+        # =====================
+        # CUSTOMERS
+        # =====================
         for _, row in df.iterrows():
-            loc = geolocator.geocode(str(row[address_col]))
-            time.sleep(1)
+            addr = str(row[address_col])
 
-            if loc:
+            geo = geocode_address(geolocator, addr)
+
+            if geo:
                 locations.append({
-                    "address": str(row[address_col]),
-                    "lat": loc.latitude,
-                    "lon": loc.longitude,
+                    "address": addr,
+                    "lat": geo["lat"],
+                    "lon": geo["lon"],
                     "is_depot": False
                 })
+
+            time.sleep(0.5)  # safe rate limiting
 
         if len(locations) < 2:
             st.error("Need at least 2 valid locations")
@@ -190,28 +244,35 @@ if uploaded_file:
 
         st.success(f"Geocoded {len(locations)} locations")
 
-        # Time matrix
+        # =====================
+        # TIME MATRIX
+        # =====================
         n = len(locations)
         time_matrix = np.zeros((n, n), dtype=int)
 
-        for i in range(n):
-            for j in range(n):
-                if i == j:
-                    continue
+        with st.spinner("Building travel matrix..."):
+            for i in range(n):
+                for j in range(n):
 
-                try:
-                    url = f"http://router.project-osrm.org/route/v1/driving/{locations[i]['lon']},{locations[i]['lat']};{locations[j]['lon']},{locations[j]['lat']}?overview=false"
-                    r = requests.get(url).json()
+                    if i == j:
+                        continue
 
-                    duration = r["routes"][0]["duration"] / 60
-                    time_matrix[i][j] = int(duration) + SERVICE_TIME_MIN
+                    try:
+                        url = f"http://router.project-osrm.org/route/v1/driving/{locations[i]['lon']},{locations[i]['lat']};{locations[j]['lon']},{locations[j]['lat']}?overview=false"
+                        r = requests.get(url, timeout=8).json()
 
-                except:
-                    dist = haversine_distance(locations[i], locations[j])
-                    time_matrix[i][j] = int(dist * 2) + SERVICE_TIME_MIN
+                        duration = r["routes"][0]["duration"] / 60
+                        time_matrix[i][j] = int(duration) + SERVICE_TIME_MIN
 
-        # Solve
-        solution = solve_route(locations, time_matrix, day_start, day_end)
+                    except:
+                        dist = haversine_distance(locations[i], locations[j])
+                        time_matrix[i][j] = int(dist * 2) + SERVICE_TIME_MIN
+
+        # =====================
+        # SOLVE ROUTE
+        # =====================
+        with st.spinner("Optimizing route..."):
+            solution = solve_route(locations, time_matrix, day_start, day_end)
 
         if not solution:
             st.error("No feasible route found")
@@ -221,7 +282,7 @@ if uploaded_file:
 
         route_df = pd.DataFrame([
             {
-                "Stop": i+1,
+                "Stop": i + 1,
                 "Address": locations[idx]["address"]
             }
             for i, idx in enumerate(route)
@@ -238,3 +299,11 @@ if uploaded_file:
 
         # Map
         st_folium(create_folium_map([locations[i] for i in route]), width=800)
+
+        # Download
+        st.download_button(
+            "Download Route CSV",
+            route_df.to_csv(index=False),
+            "route.csv",
+            "text/csv"
+        )
