@@ -1,0 +1,8 @@
+C:\Time Out Lawncare\customer-route-optimizer>venv\Scripts\activate
+
+
+streamlit run app.py
+
+
+Google API key
+AIzaSyAw6RmDnY3jChsSdWmfGuDWa2ejvLt3NlU

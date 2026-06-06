@@ -1,0 +1,333 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
+import time
+import re
+
+from urllib.parse import quote
+from math import radians, sin, cos, sqrt, atan2
+
+from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
+
+# =========================================================
+# APP CONFIG
+# =========================================================
+st.set_page_config(page_title="Dispatch Optimizer", page_icon="🚚", layout="wide")
+st.title("🚚 Lawn Care Dispatch Optimizer (Stable Version)")
+
+SERVICE_TIME_MIN = 30
+
+
+# =========================================================
+# GOOGLE API KEY
+# =========================================================
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
+
+st.write("API KEY LOADED:", bool(GOOGLE_API_KEY))
+# =========================================================
+# CLEAN ADDRESS
+# =========================================================
+def clean(addr):
+    if addr is None:
+        return ""
+    addr = str(addr)
+    addr = re.sub(r"\s+", " ", addr)
+    return addr.strip()
+
+
+# =========================================================
+# GOOGLE GEOCODING
+# =========================================================
+def google_geocode(address):
+
+    if not GOOGLE_API_KEY:
+        return None
+
+    try:
+        url = (
+            "https://maps.googleapis.com/maps/api/geocode/json"
+            f"?address={quote(address)}&key={GOOGLE_API_KEY}"
+        )
+
+        r = requests.get(url, timeout=10).json()
+
+        status = r.get("status")
+        results = r.get("results", [])
+
+        # DEBUG SAFETY: show real API response if needed
+        # st.write("Google:", address, status)
+
+        if status == "OK" and results:
+            loc = results[0]["geometry"]["location"]
+            return {"lat": loc["lat"], "lon": loc["lng"], "source": "google"}
+
+    except Exception:
+        pass
+
+    return None
+
+
+# =========================================================
+# OSM FALLBACK
+# =========================================================
+def osm_geocode(address):
+
+    try:
+        url = (
+            "https://nominatim.openstreetmap.org/search"
+            f"?q={quote(address + ', USA')}&format=json&limit=1"
+        )
+
+        headers = {"User-Agent": "dispatch-app"}
+
+        r = requests.get(url, headers=headers, timeout=10).json()
+
+        if r:
+            return {
+                "lat": float(r[0]["lat"]),
+                "lon": float(r[0]["lon"]),
+                "source": "osm"
+            }
+
+    except Exception:
+        pass
+
+    return None
+
+
+# =========================================================
+# MASTER GEOCODER
+# =========================================================
+def geocode(address):
+
+    address = clean(address)
+
+    g = google_geocode(address)
+    if g:
+        return g
+
+    return osm_geocode(address)
+
+
+# =========================================================
+# DISTANCE
+# =========================================================
+def haversine(a, b):
+
+    R = 6371
+
+    lat1 = radians(a["lat"])
+    lon1 = radians(a["lon"])
+    lat2 = radians(b["lat"])
+    lon2 = radians(b["lon"])
+
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    x = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
+
+    return 2 * R * atan2(sqrt(x), sqrt(1-x))
+
+
+# =========================================================
+# ROUTE SOLVER
+# =========================================================
+def solve_route(locations, matrix):
+
+    n = len(locations)
+    manager = pywrapcp.RoutingIndexManager(n, 1, 0)
+    routing = pywrapcp.RoutingModel(manager)
+
+    def cb(i, j):
+        return int(matrix[
+            manager.IndexToNode(i)
+        ][
+            manager.IndexToNode(j)
+        ])
+
+    transit = routing.RegisterTransitCallback(cb)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit)
+
+    params = pywrapcp.DefaultRoutingSearchParameters()
+    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    params.time_limit.FromSeconds(20)
+
+    sol = routing.SolveWithParameters(params)
+
+    if not sol:
+        return None
+
+    route = []
+    total = 0
+
+    index = routing.Start(0)
+
+    while not routing.IsEnd(index):
+
+        node = manager.IndexToNode(index)
+        route.append(node)
+
+        prev = index
+        index = sol.Value(routing.NextVar(index))
+
+        total += matrix[
+            manager.IndexToNode(prev)
+        ][
+            manager.IndexToNode(index)
+        ]
+
+    route.append(manager.IndexToNode(index))
+
+    return route, total
+
+
+# =========================================================
+# GOOGLE MAPS EXPORT
+# =========================================================
+def google_maps(addresses):
+
+    if len(addresses) < 2:
+        return None
+
+    origin = quote(addresses[0])
+    dest = quote(addresses[-1])
+
+    waypoints = "|".join(quote(a) for a in addresses[1:-1])
+
+    url = (
+        "https://www.google.com/maps/dir/?api=1"
+        f"&origin={origin}"
+        f"&destination={dest}"
+    )
+
+    if waypoints:
+        url += f"&waypoints={waypoints}"
+
+    return url
+
+
+# =========================================================
+# UI STATE SAFE
+# =========================================================
+uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx", "xls"])
+
+df = None
+
+if uploaded_file is not None:
+    try:
+        df = pd.read_excel(uploaded_file)
+        st.success(f"Loaded {len(df)} rows")
+        st.dataframe(df.head())
+    except Exception as e:
+        st.error(f"Excel error: {e}")
+        st.stop()
+
+
+if df is not None:
+
+    col = st.selectbox("Address Column", df.columns)
+
+    depot = st.text_input("Depot Address (optional)")
+
+    run = st.button("🚀 Generate Dispatch")
+
+    if run:
+
+        locations = []
+        failed = []
+
+        st.info("Geocoding addresses...")
+
+        # DEPOT
+        if depot.strip():
+            g = geocode(depot)
+            if g:
+                locations.append({"address": depot, **g})
+            else:
+                failed.append(depot)
+
+        # CUSTOMERS
+        for i, r in df.iterrows():
+
+            addr = clean(r[col])
+            g = geocode(addr)
+
+            if g:
+                locations.append({"address": addr, **g})
+            else:
+                failed.append(addr)
+
+            time.sleep(0.2)
+
+        # DEBUG PANEL
+        st.subheader("📍 Geocoding Summary")
+        st.write("Input rows:", len(df))
+        st.write("Valid geocodes:", len(locations))
+        st.write("Failed:", len(failed))
+
+        if failed:
+            st.dataframe(pd.DataFrame(failed, columns=["Failed Address"]))
+
+        if len(locations) < 2:
+            st.error("Not enough valid geocodes to build route")
+            st.stop()
+
+        # MATRIX
+        n = len(locations)
+        matrix = np.zeros((n, n))
+
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    matrix[i][j] = haversine(locations[i], locations[j]) * 2
+
+        # ROUTE
+        result = solve_route(locations, matrix)
+
+        if not result:
+            st.error("Routing failed")
+            st.stop()
+
+        route, total = result
+        ordered = [locations[i] for i in route]
+
+        # =====================================================
+        # DISPATCH TABLE
+        # =====================================================
+        st.subheader("📍 Dispatch Sheet")
+
+        dispatch = pd.DataFrame([
+            {"Stop": i+1, "Address": x["address"]}
+            for i, x in enumerate(ordered)
+        ])
+
+        st.dataframe(dispatch)
+
+        st.download_button(
+            "📥 Download CSV",
+            dispatch.to_csv(index=False),
+            "dispatch.csv",
+            "text/csv"
+        )
+
+        # =====================================================
+        # GOOGLE MAPS LINK
+        # =====================================================
+        st.subheader("🚗 Google Maps Export")
+
+        url = google_maps([x["address"] for x in ordered])
+
+        if url:
+            st.markdown(f"[Open Route in Google Maps]({url})")
+            st.code(url)
+        else:
+            st.warning("Could not generate Google Maps link")
+
+        # =====================================================
+        # SUMMARY
+        # =====================================================
+        st.metric("Total Estimated Distance Score", int(total))
+        st.success("Dispatch complete")
