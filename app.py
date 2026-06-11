@@ -1,90 +1,168 @@
+# =========================================================
+# app.py
+# FULL CRM + DISPATCH + SQLITE IMPORT FOUNDATION
+# =========================================================
+
 import streamlit as st
 import pandas as pd
-import numpy as np
+import sqlite3
 import requests
-import time
-import re
 import json
 import os
+import re
+import time
 
 from urllib.parse import quote
-from math import radians, sin, cos, sqrt, atan2
 from datetime import datetime
 
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-
 
 # =========================================================
-# CONFIG
+# PAGE CONFIG
 # =========================================================
 st.set_page_config(
-    page_title="Field Ops Dispatch System",
-    page_icon="🚚",
+    page_title="Time Out Lawncare CRM",
+    page_icon="🌿",
     layout="wide"
 )
 
-st.title("🚚 Field Operations Dispatch System")
-
-SAVE_FILE = "last_dispatch.json"
-GEO_CACHE_FILE = "geo_cache.json"
+st.title("🌿 Time Out Lawncare CRM + Dispatch")
 
 
 # =========================================================
-# SESSION STATE
+# DATABASE
 # =========================================================
-if "dispatch" not in st.session_state:
-    st.session_state.dispatch = None
+DB_FILE = "crm.db"
 
-if "completed" not in st.session_state:
-    st.session_state.completed = set()
+conn = sqlite3.connect(
+    "crm.db",
+    check_same_thread=False,
+    timeout=30
+)
 
-if "arrival_times" not in st.session_state:
-    st.session_state.arrival_times = {}
-
-if "completion_times" not in st.session_state:
-    st.session_state.completion_times = {}
+cursor = conn.cursor()
 
 
 # =========================================================
-# LOAD SAVED DISPATCH
+# CREATE TABLES
 # =========================================================
-if (
-    st.session_state.dispatch is None
-    and os.path.exists(SAVE_FILE)
-):
+cursor.execute("""
 
-    try:
+CREATE TABLE IF NOT EXISTS customers (
 
-        with open(SAVE_FILE, "r") as f:
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-            st.session_state.dispatch = json.load(f)
+    customer_name TEXT,
 
-    except:
-        pass
+    address TEXT,
 
+    city TEXT,
+
+    state TEXT,
+
+    zip TEXT,
+
+    phone TEXT,
+
+    email TEXT,
+
+    notes TEXT,
+
+    service_type TEXT,
+
+    lawn_sqft REAL,
+
+    price REAL,
+
+    lat REAL,
+
+    lon REAL,
+
+    active INTEGER DEFAULT 1
+)
+
+""")
+
+cursor.execute("""
+
+CREATE TABLE IF NOT EXISTS applications (
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    customer_name TEXT,
+
+    service_date TEXT,
+
+    applicator TEXT,
+
+    treatment_type TEXT,
+
+    lawn_sqft REAL,
+
+    product_name TEXT,
+
+    application_rate TEXT,
+
+    quantity_used TEXT,
+
+    notes TEXT
+)
+
+""")
+
+cursor.execute("""
+
+CREATE TABLE IF NOT EXISTS services (
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    service_name TEXT,
+
+    price REAL
+)
+
+""")
+
+cursor.execute("""
+
+CREATE TABLE IF NOT EXISTS chemicals (
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    product_name TEXT,
+
+    chemical_type TEXT,
+
+    cost REAL,
+
+    application_rate TEXT
+)
+
+""")
+
+conn.commit()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS herbicides (
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    product_name TEXT,
+    epa_number TEXT,
+    common_name TEXT,
+    moa TEXT,
+    active_ingredients TEXT,
+    manufacturer_rates TEXT,
+    fall_rate TEXT,
+    spring_jan_rate TEXT,
+    spring_apr_rate TEXT
+
+)
+""")
+
+conn.commit()
 
 # =========================================================
-# LOAD GEO CACHE
-# =========================================================
-if os.path.exists(GEO_CACHE_FILE):
-
-    try:
-
-        with open(GEO_CACHE_FILE, "r") as f:
-
-            GEO_CACHE = json.load(f)
-
-    except:
-
-        GEO_CACHE = {}
-
-else:
-
-    GEO_CACHE = {}
-
-
-# =========================================================
-# GOOGLE API KEY
+# GOOGLE API
 # =========================================================
 GOOGLE_API_KEY = st.secrets.get(
     "GOOGLE_API_KEY",
@@ -93,140 +171,28 @@ GOOGLE_API_KEY = st.secrets.get(
 
 
 # =========================================================
-# HELPERS
+# GEOCODING
 # =========================================================
-def clean(addr):
+def clean_address(addr):
 
-    if addr is None:
+    if pd.isna(addr):
         return ""
 
-    addr = str(addr)
+    addr = str(addr).strip()
 
-    addr = re.sub(r"\s+", " ", addr)
-
-    return addr.strip()
-
-
-def nav(address):
-
-    return (
-        "https://www.google.com/maps/search/?api=1&query="
-        + quote(address)
+    addr = re.sub(
+        r"\s+",
+        " ",
+        addr
     )
 
-
-# =========================================================
-# GOOGLE MAPS FULL ROUTE
-# =========================================================
-def full_route_link(addresses):
-
-    if len(addresses) < 2:
-        return None
-
-    chunks = []
-
-    max_stops = 10
-
-    for i in range(0, len(addresses), max_stops):
-
-        chunk = addresses[i:i + max_stops]
-
-        if len(chunk) < 2:
-            continue
-
-        origin = quote(chunk[0])
-
-        destination = quote(chunk[-1])
-
-        waypoints = "|".join(
-            quote(x)
-            for x in chunk[1:-1]
-        )
-
-        url = (
-            "https://www.google.com/maps/dir/?api=1"
-            f"&origin={origin}"
-            f"&destination={destination}"
-            f"&travelmode=driving"
-        )
-
-        if waypoints:
-            url += f"&waypoints={waypoints}"
-
-        chunks.append(url)
-
-    return chunks
+    return addr
 
 
-# =========================================================
-# SAVE GEO CACHE
-# =========================================================
-def save_geo_cache():
-
-    try:
-
-        with open(GEO_CACHE_FILE, "w") as f:
-
-            json.dump(GEO_CACHE, f)
-
-    except:
-        pass
-
-
-# =========================================================
-# ADDRESS NORMALIZATION
-# =========================================================
-def normalize_address(address):
-
-    address = clean(address)
-
-    replacements = {
-
-        " dr.": " drive",
-        " dr ": " drive ",
-
-        " rd.": " road",
-        " rd ": " road ",
-
-        " st.": " street",
-        " st ": " street ",
-
-        " blvd.": " boulevard",
-        " blvd ": " boulevard ",
-
-        " ct.": " court",
-        " ct ": " court ",
-
-        " cir.": " circle",
-        " cir ": " circle ",
-
-        " hwy ": " highway ",
-
-        " ln.": " lane",
-        " ln ": " lane ",
-
-        " ave.": " avenue",
-        " ave ": " avenue "
-    }
-
-    addr = " " + address.lower() + " "
-
-    for k, v in replacements.items():
-
-        addr = addr.replace(k, v)
-
-    addr = re.sub(r"\s+", " ", addr)
-
-    return addr.strip()
-
-
-# =========================================================
-# GOOGLE GEOCODE
-# =========================================================
-def google_geocode(address):
+def geocode(address):
 
     if not GOOGLE_API_KEY:
-        return None
+        return None, None
 
     try:
 
@@ -241,742 +207,741 @@ def google_geocode(address):
             timeout=10
         ).json()
 
-        status = response.get("status")
+        if response["status"] == "OK":
 
-        if (
-            status == "OK"
-            and response.get("results")
-        ):
+            loc = response["results"][0]["geometry"]["location"]
 
-            loc = (
-                response["results"][0]
-                ["geometry"]
-                ["location"]
-            )
-
-            return {
-                "lat": loc["lat"],
-                "lon": loc["lng"]
-            }
-
-    except:
-        pass
-
-    return None
-
-
-# =========================================================
-# OSM GEOCODE
-# =========================================================
-def osm_geocode(address):
-
-    try:
-
-        url = (
-            "https://nominatim.openstreetmap.org/search"
-            f"?q={quote(address)}"
-            f"&format=json"
-            f"&limit=1"
-            f"&countrycodes=us"
-        )
-
-        headers = {
-            "User-Agent": "field-ops-routing"
-        }
-
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=10
-        ).json()
-
-        if response:
-
-            return {
-                "lat": float(response[0]["lat"]),
-                "lon": float(response[0]["lon"])
-            }
-
-    except:
-        pass
-
-    return None
-
-
-# =========================================================
-# PRODUCTION GEOCODER
-# =========================================================
-def geocode(address):
-
-    address = normalize_address(address)
-
-    # =====================================================
-    # CACHE HIT
-    # =====================================================
-    if address in GEO_CACHE:
-
-        return GEO_CACHE[address]
-
-    attempts = [
-
-        address,
-
-        address + ", USA",
-
-        address + ", Brandon, MS",
-
-        address + ", Mississippi",
-
-        address.replace("highway", "hwy"),
-
-        address.replace("street", "st"),
-
-        address.replace("drive", "dr"),
-
-        address.replace("court", "ct"),
-
-        address.replace("circle", "cir")
-    ]
-
-    attempts = list(dict.fromkeys(attempts))
-
-    for attempt in attempts:
-
-        # =================================================
-        # GOOGLE FIRST
-        # =================================================
-        result = google_geocode(attempt)
-
-        if result:
-
-            GEO_CACHE[address] = result
-
-            save_geo_cache()
-
-            return result
-
-        # =================================================
-        # FALLBACK OSM
-        # =================================================
-        result = osm_geocode(attempt)
-
-        if result:
-
-            GEO_CACHE[address] = result
-
-            save_geo_cache()
-
-            return result
-
-        time.sleep(0.15)
-
-    return None
-
-
-# =========================================================
-# DISTANCE
-# =========================================================
-def haversine(a, b):
-
-    R = 6371
-
-    lat1 = radians(a["lat"])
-    lon1 = radians(a["lon"])
-
-    lat2 = radians(b["lat"])
-    lon2 = radians(b["lon"])
-
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-
-    x = (
-        sin(dlat / 2) ** 2
-        + cos(lat1)
-        * cos(lat2)
-        * sin(dlon / 2) ** 2
-    )
-
-    return 2 * R * atan2(
-        sqrt(x),
-        sqrt(1 - x)
-    )
-
-
-# =========================================================
-# CLUSTER KEY
-# =========================================================
-def cluster_key(address):
-
-    parts = address.split(",")
-
-    if len(parts) > 0:
-
-        street = parts[0].strip().lower()
-
-        words = street.split()
-
-        if len(words) > 1:
-
-            return words[-1]
-
-    return "other"
-
-
-# =========================================================
-# ROUTE SOLVER
-# =========================================================
-def solve_route(locations, matrix):
-
-    n = len(locations)
-
-    manager = pywrapcp.RoutingIndexManager(
-        n,
-        1,
-        0
-    )
-
-    routing = pywrapcp.RoutingModel(manager)
-
-    def cb(i, j):
-
-        return int(
-            matrix[
-                manager.IndexToNode(i)
-            ][
-                manager.IndexToNode(j)
-            ]
-        )
-
-    transit = routing.RegisterTransitCallback(cb)
-
-    routing.SetArcCostEvaluatorOfAllVehicles(
-        transit
-    )
-
-    params = pywrapcp.DefaultRoutingSearchParameters()
-
-    params.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    )
-
-    params.local_search_metaheuristic = (
-        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    )
-
-    params.time_limit.FromSeconds(30)
-
-    solution = routing.SolveWithParameters(params)
-
-    if not solution:
-        return None
-
-    route = []
-
-    total = 0
-
-    index = routing.Start(0)
-
-    while not routing.IsEnd(index):
-
-        node = manager.IndexToNode(index)
-
-        route.append(node)
-
-        prev = index
-
-        index = solution.Value(
-            routing.NextVar(index)
-        )
-
-        total += matrix[
-            manager.IndexToNode(prev)
-        ][
-            manager.IndexToNode(index)
-        ]
-
-    route.append(
-        manager.IndexToNode(index)
-    )
-
-    return route, total
-
-
-# =========================================================
-# FILE UPLOAD
-# =========================================================
-uploaded_file = st.file_uploader(
-    "Upload Customer List",
-    type=["xlsx", "xls"]
-)
-
-df = None
-
-if uploaded_file:
-
-    try:
-
-        df = pd.read_excel(uploaded_file)
-
-        st.success(
-            f"Loaded {len(df)} customers"
-        )
+            return loc["lat"], loc["lng"]
 
     except Exception as e:
 
-        st.error(f"Excel read error: {e}")
+        st.error(
+            f"Customer skipped: {e}"
+        )
+
+    return None, None
 
 
 # =========================================================
-# MAIN
+# TABS
 # =========================================================
-if df is not None:
+tab1, tab2, tab3, tab4 = st.tabs([
 
-    st.subheader("📋 Customer Selection")
+    "📥 Import Workbook",
 
-    address_col = st.selectbox(
-        "Address Column",
-        df.columns
+    "👥 CRM",
+
+    "🚚 Dispatch",
+
+    "📊 Reports"
+
+])
+
+
+# =========================================================
+# IMPORT WORKBOOK
+# =========================================================
+with tab1:
+
+    c1, c2 = st.columns(2)
+
+with c1:
+
+    if st.button(
+        "🗑️ Clear Customers",
+        key="clear_customers"
+    ):
+
+        cursor.execute(
+            "DELETE FROM customers"
+        )
+
+        conn.commit()
+
+        st.success(
+            "Customers cleared"
+        )
+
+with c2:
+
+    if st.button(
+        "🗑️ Clear Applications",
+        key="clear_applications"
+    ):
+
+        cursor.execute(
+            "DELETE FROM applications"
+        )
+
+        conn.commit()
+
+        st.success(
+            "Applications cleared"
+        ) 
+
+    st.header("📥 Import Existing Workbook")
+
+    uploaded = st.file_uploader(
+        "Upload Excel Workbook",
+        type=["xlsx"]
     )
 
-    depot = st.text_input(
-        "Depot Address (optional)"
+    if uploaded:
+
+        workbook = pd.ExcelFile(uploaded)
+
+        st.success(
+            f"Workbook loaded with "
+            f"{len(workbook.sheet_names)} sheets"
+        )
+
+        st.write(workbook.sheet_names)
+
+    if uploaded and "Herbicide_Data" in workbook.sheet_names:
+        st.subheader("Herbicide_Data")
+
+        tp_df = pd.read_excel(
+            workbook,
+            sheet_name="Herbicide_Data",
+            header=None
+        )
+
+        st.dataframe(
+            tp_df.head(25)
+        )
+    
+        if "Herbicide_Data" in workbook.sheet_names:
+
+            herb_df = pd.read_excel(
+            workbook,
+            sheet_name="Herbicide_Data"
+        )
+
+        st.subheader("Herbicide Data Preview")
+
+        st.dataframe(
+            herb_df.head()
+        )
+
+        if st.button("Import Herbicides"):
+
+            cursor.execute(
+                "DELETE FROM herbicides"
+            )
+
+            conn.commit()
+
+            imported = 0
+
+            for _, row in herb_df.iterrows():
+
+                if pd.isna(row.get("Name")):
+                    continue
+
+                cursor.execute(
+                    """
+                    INSERT INTO herbicides (
+
+                        product_name,
+                        epa_number,
+                        common_name,
+                        moa,
+                        active_ingredients,
+                        manufacturer_rates,
+                        fall_rate,
+                        spring_jan_rate,
+                        spring_apr_rate
+
+                    )
+
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(row.get("Name", "")),
+                        str(row.get("EPA Number", "")),
+                        str(row.get("Common Name", "")),
+                        str(row.get("MOA", "")),
+                        str(row.get("Active Ingredients", "")),
+                        str(row.get("Mfgr. Rates", "")),
+                        str(row.get("Application Rates Oz. per Acre (Fall)", "")),
+                        str(row.get("Application Rates Oz. per Acre (Spring - Jan)", "")),
+                        str(row.get("Application Rates Oz. per Acre (Spring - Apr)", ""))
+                    )
+                )
+
+                imported += 1
+
+            conn.commit()
+
+            st.success(
+                f"Imported {imported} herbicides"
+            )
+
+# =========================================================
+# CRM
+# =========================================================
+
+with tab2:
+
+    st.header("👥 Customer CRM")
+
+    customer_df = pd.read_sql_query(
+        """
+        SELECT *
+        FROM customers
+        ORDER BY customer_name
+        """,
+        conn
     )
 
-    df["Include"] = True
+    st.write(
+        f"Customers Loaded: {len(customer_df)}"
+    )
 
-    edited_df = st.data_editor(
-        df,
+    search = st.text_input(
+        "Search Customers"
+    )
+
+    if search:
+
+        customer_df = customer_df[
+            customer_df["customer_name"]
+            .astype(str)
+            .str.contains(
+                search,
+                case=False,
+                na=False
+            )
+        ]
+
+    st.dataframe(
+        customer_df,
         use_container_width=True
     )
 
-    selected_df = edited_df[
-        edited_df["Include"] == True
-    ]
+    st.subheader("Customer Summary")
 
-    st.success(
-        f"{len(selected_df)} customers selected"
-    )
+    total_customers = len(customer_df)
 
-    # =====================================================
-    # GENERATE ROUTE
-    # =====================================================
-    if st.button("🚀 Generate Dispatch"):
+    st.metric(
+        "Total Customers",
+        total_customers
+    ) 
 
-        locations = []
-        failed = []
-
-        depot_location = None
-
-        st.info("Geocoding addresses...")
-
+   
         # =================================================
-        # DEPOT
+        # IMPORT CUSTOMERS
         # =================================================
-        if depot:
+    if uploaded and "Customer_Data" in workbook.sheet_names:
 
-            geo = geocode(depot)
-
-            if geo:
-
-                depot_location = {
-                    "address": depot,
-                    **geo
-                }
-
-        # =================================================
-        # CUSTOMERS
-        # =================================================
-        progress = st.progress(0)
-
-        total_rows = len(selected_df)
-
-        for counter, (_, row) in enumerate(
-            selected_df.iterrows(),
-            start=1
-        ):
-
-            addr = clean(
-                row[address_col]
+            customer_df = pd.read_excel(
+                workbook,
+                sheet_name="Customer_Data"
             )
 
-            geo = geocode(addr)
-
-            if geo:
-
-                locations.append({
-                    "address": addr,
-                    **geo
-                })
-
-            else:
-
-                failed.append(addr)
-
-            percent = int(
-                (counter / max(total_rows, 1)) * 100
-            )
-
-            percent = min(percent, 100)
-
-            progress.progress(percent)
-
-        # =================================================
-        # RESULTS
-        # =================================================
-        st.success(
-            f"Valid geocodes: {len(locations)}"
-        )
-
-        if failed:
-
-            st.warning(
-                f"Failed geocodes: {len(failed)}"
-            )
+            st.subheader("Customer_Data Preview")
 
             st.dataframe(
-                pd.DataFrame(
-                    failed,
-                    columns=["Failed Address"]
+                customer_df.head()
+            )
+
+            if st.button(
+                "Import Customers",
+                key="import_customers"
+            ):
+
+                cursor.execute(
+                    "DELETE FROM customers"
                 )
+
+                conn.commit()
+
+                imported = 0
+
+            for _, row in customer_df.iterrows():
+
+                    try:
+
+                        customer_name = str(
+                            row.get("Customer Name", "")
+                        )
+
+                        address = clean_address(
+                            row.get("Address", "")
+                        )
+
+                        city = str(
+                            row.get("City", "")
+                        )
+
+                        state = str(
+                            row.get("State", "")
+                        )
+
+                        zip_code = str(
+                            row.get("Zip", "")
+                        )
+
+                        phone = str(
+                            row.get("Phone", "")
+                        )
+
+                        email = str(
+                            row.get("Email", "")
+                        )
+
+                        notes = str(
+                            row.get("Notes", "")
+                        )
+
+                        lawn_sqft = row.get(
+                            "Sq Ft",
+                            None
+                        )
+
+                        full_address = (
+                            f"{address}, "
+                            f"{city}, "
+                            f"{state} "
+                            f"{zip_code}"
+                        )
+
+                        lat, lon = geocode(
+                            full_address
+                        )
+
+                        cursor.execute("""
+
+                        INSERT INTO customers (
+
+                            customer_name,
+                            address,
+                            city,
+                            state,
+                            zip,
+                            phone,
+                            email,
+                            notes,
+                            lawn_sqft,
+                            lat,
+                            lon
+
+                        )
+
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+                        """, (
+
+                            customer_name,
+                            address,
+                            city,
+                            state,
+                            zip_code,
+                            phone,
+                            email,
+                            notes,
+                            lawn_sqft,
+                            lat,
+                            lon
+
+                        ))
+
+                        imported += 1
+
+                    except Exception as e:
+
+                            st.error(
+                                f"Failed to import customer: "
+                                f"{customer_name}"
+                            )    
+
+                            st.write(str(e))
+ 
+            conn.commit()
+
+            st.success(
+                f"Imported {imported} customers"
             )
 
-        if len(locations) < 2:
+        # =================================================
+        # IMPORT APPLICATIONS
+        # =================================================
+    if uploaded and "Applications" in workbook.sheet_names:
 
-            st.error(
-                "Not enough valid locations"
+            app_df = pd.read_excel(
+                workbook,
+                sheet_name="Applications"
             )
 
-            st.stop()
+            st.subheader("Applications Columns")
 
-        # =================================================
-        # CLUSTER
-        # =================================================
-        st.info("Clustering neighborhoods...")
+            st.write(list(app_df.columns))
 
-        customer_locs = locations.copy()
+            st.subheader("Applications Preview")
 
-        customer_locs.sort(
-            key=lambda x: (
-                cluster_key(x["address"]),
-                x["lat"],
-                x["lon"]
-            )
-        )
-
-        locations = customer_locs
-
-        # =================================================
-        # ADD DEPOT AS START ONLY
-        # =================================================
-        if depot_location:
-
-            locations.insert(0, depot_location)
-
-        # =================================================
-        # MATRIX
-        # =================================================
-        st.info("Building road network matrix...")
-
-        n = len(locations)
-
-        matrix = np.zeros((n, n))
-
-        for i in range(n):
-
-            for j in range(n):
-
-                if i == j:
-                    continue
-
-                try:
-
-                    url = (
-                        "https://router.project-osrm.org/route/v1/driving/"
-                        f"{locations[i]['lon']},{locations[i]['lat']};"
-                        f"{locations[j]['lon']},{locations[j]['lat']}"
-                        "?overview=false"
-                    )
-
-                    r = requests.get(
-                        url,
-                        timeout=8
-                    ).json()
-
-                    seconds = (
-                        r["routes"][0]["duration"]
-                    )
-
-                    matrix[i][j] = int(
-                        seconds / 60
-                    )
-
-                except:
-
-                    matrix[i][j] = int(
-                        haversine(
-                            locations[i],
-                            locations[j]
-                        ) * 2
-                    )
-
-        # =================================================
-        # SOLVE
-        # =================================================
-        st.info("Optimizing route...")
-
-        result = solve_route(
-            locations,
-            matrix
-        )
-
-        if not result:
-
-            st.error("Routing failed")
-
-            st.stop()
-
-        route, total = result
-
-        ordered = [
-            locations[i]
-            for i in route
-        ]
-
-        # =================================================
-        # REMOVE DEPOT FROM DRIVER STOPS
-        # =================================================
-        if depot_location:
-
-            ordered = ordered[1:]
-
-        # =================================================
-        # SAVE
-        # =================================================
-        st.session_state.dispatch = {
-            "ordered": ordered,
-            "total": total,
-            "depot": depot_location
-        }
-
-        st.session_state.completed = set()
-
-        st.session_state.arrival_times = {}
-
-        st.session_state.completion_times = {}
-
-        with open(SAVE_FILE, "w") as f:
-
-            json.dump(
-                st.session_state.dispatch,
-                f
+            st.dataframe(
+                app_df.head()
             )
 
-        st.success(
-            "Dispatch generated successfully"
-        )
+            if st.button(
+                "Import Applications",
+                key="import_applications"
+            ):
 
+                cursor.execute(
+                    "DELETE FROM applications"
+                )
+
+                conn.commit()
+
+                imported = 0
+
+                app_df = app_df.dropna(
+                    subset=[
+                        "Customer Name",
+                        "Application Date"
+                    ],
+                    how="all"
+                )
+
+                for _, row in app_df.iterrows():
+
+                    try:
+
+                        cursor.execute(
+                            """
+
+                            INSERT INTO applications (
+
+                                customer_name,
+                                service_date,
+                                applicator,
+                                treatment_type,
+                                lawn_sqft,
+                                product_name,
+                                application_rate,
+                                quantity_used,
+                                notes
+
+                            )
+
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+                            """,
+                            (
+                                str(row.get("Customer Name", "")),
+                                str(row.get("Application Date", "")),
+                                str(row.get("Applicator", "")),
+                                str(row.get("Treatment Type", "")),
+                                row.get("Size of Area Treated", None),
+                                str(row.get("Brand Name 1", "")),
+                                str(row.get("Rate per Acre", "")),
+                                str(row.get("Total Amount Applied (Oz)", "")),
+                                ""
+                            )
+                        )
+
+                        imported += 1
+
+                    except Exception as e:
+
+                        st.warning(
+                            f"Skipped row: {e}"
+                        )
+
+                conn.commit()
+
+                st.success(
+                    f"Imported {imported} applications"
+                )
 
 # =========================================================
-# DISPATCH BOARD
+# IMPORT HERBICIDES
 # =========================================================
-if st.session_state.dispatch:
 
-    ordered = st.session_state.dispatch["ordered"]
+if uploaded and "Herbicide_Data" in workbook.sheet_names:
 
-    depot_location = st.session_state.dispatch.get(
-        "depot"
+    herb_df = pd.read_excel(
+        workbook,
+        sheet_name="Herbicide_Data"
     )
 
-    st.subheader("🚚 Dispatch Board")
-
-    # =====================================================
-    # FULL GOOGLE ROUTE LINKS
-    # =====================================================
-    route_addresses = [
-        x["address"]
-        for x in ordered
-    ]
-
-    if depot_location:
-
-        route_addresses.insert(
-            0,
-            depot_location["address"]
-        )
-
-    route_links = full_route_link(
-        route_addresses
-    )
-
-    if route_links:
-
-        st.subheader("🗺️ Full Google Maps Route")
-
-        for idx, link in enumerate(route_links):
-
-            st.markdown(
-                f"[Open Route Segment {idx+1}]({link})"
-            )
-
-    # =====================================================
-    # DISPATCH TABLE
-    # =====================================================
-    board = []
-
-    for i, stop in enumerate(ordered):
-
-        board.append({
-            "Stop": i + 1,
-            "Address": stop["address"],
-            "Completed": (
-                i in st.session_state.completed
-            ),
-            "Navigate": nav(stop["address"])
-        })
-
-    dispatch_df = pd.DataFrame(board)
+    st.subheader("🌱 Herbicide Data")
 
     st.dataframe(
+        herb_df.head()
+    )
+
+    if st.button(
+    "Import Herbicides",
+    key="import_herbicides_btn"
+    ):
+
+        cursor.execute(
+            "DELETE FROM herbicides"
+        )
+
+        conn.commit()
+
+        imported = 0
+
+        for _, row in herb_df.iterrows():
+
+            product_name = str(
+                row.get("Name", "")
+            ).strip()
+
+            if (
+                product_name == ""
+                or product_name.lower() == "nan"
+            ):
+                continue
+
+            try:
+
+                cursor.execute(
+                    """
+                    INSERT INTO herbicides (
+
+                        product_name,
+                        epa_number,
+                        common_name,
+                        moa,
+                        active_ingredients,
+                        manufacturer_rates,
+                        fall_rate,
+                        spring_jan_rate,
+                        spring_apr_rate
+
+                    )
+
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        product_name,
+                        str(row.get("EPA Number", "")),
+                        str(row.get("Common Name", "")),
+                        str(row.get("MOA", "")),
+                        str(row.get("Active Ingredients", "")),
+                        str(row.get("Mfgr. Rates", "")),
+                        str(row.get("Application Rates Oz. per Acre (Fall)", "")),
+                        str(row.get("Application Rates Oz. per Acre (Spring - Jan)", "")),
+                        str(row.get("Application Rates Oz. per Acre (Spring - Apr)", ""))
+                    )
+                )
+
+                imported += 1
+
+            except Exception as e:
+
+                st.warning(
+                    f"Skipped row: {e}"
+                )
+
+        conn.commit()
+
+        st.success(
+            f"Imported {imported} herbicides"
+        )
+# =========================================================
+# DISPATCH
+# =========================================================
+with tab3:
+
+    st.header("🚚 Dispatch Generator")
+
+    dispatch_df = pd.read_sql_query("""
+
+    SELECT *
+    FROM customers
+    WHERE active = 1
+
+    """, conn)
+
+    dispatch_df["Include"] = False
+
+    edited = st.data_editor(
         dispatch_df,
         use_container_width=True
     )
 
-    st.download_button(
-        "📥 Download Dispatch CSV",
-        dispatch_df.to_csv(index=False),
-        "dispatch.csv",
-        "text/csv"
+    selected = edited[
+        edited["Include"] == True
+    ]
+
+    st.info(
+        f"{len(selected)} customers selected"
     )
 
-    # =====================================================
-    # ACTIVE STOPS
-    # =====================================================
-    st.subheader("🚚 Active Stops")
+    if st.button("Generate Route"):
 
-    for i, stop in enumerate(ordered):
+        if len(selected) == 0:
 
-        st.markdown(f"### Stop {i+1}")
-
-        st.write(stop["address"])
-
-        col1, col2, col3 = st.columns(3)
-
-        # =================================================
-        # ARRIVED
-        # =================================================
-        with col1:
-
-            if (
-                i
-                not in st.session_state.arrival_times
-            ):
-
-                if st.button(
-                    f"Arrived #{i+1}",
-                    key=f"arrive_{i}"
-                ):
-
-                    st.session_state.arrival_times[i] = (
-                        datetime.now().strftime(
-                            "%I:%M:%S %p"
-                        )
-                    )
-
-        # =================================================
-        # COMPLETE
-        # =================================================
-        with col2:
-
-            if (
-                i
-                not in st.session_state.completed
-            ):
-
-                if st.button(
-                    f"Complete #{i+1}",
-                    key=f"complete_{i}"
-                ):
-
-                    st.session_state.completed.add(i)
-
-                    st.session_state.completion_times[i] = (
-                        datetime.now().strftime(
-                            "%I:%M:%S %p"
-                        )
-                    )
-
-        # =================================================
-        # NAVIGATE
-        # =================================================
-        with col3:
-
-            st.markdown(
-                f"[Navigate]"
-                f"({nav(stop['address'])})"
+            st.warning(
+                "No customers selected"
             )
 
-        # =================================================
-        # STATUS
-        # =================================================
-        arrival = (
-            st.session_state.arrival_times.get(i)
-        )
-
-        complete = (
-            st.session_state.completion_times.get(i)
-        )
-
-        if arrival:
+        else:
 
             st.success(
-                f"Arrived: {arrival}"
+                "Route generation module ready"
             )
 
-        if complete:
+            st.dataframe(
+                selected[
+                    [
 
-            st.info(
-                f"Completed: {complete}"
+                        "customer_name",
+
+                        "address",
+
+                        "city",
+
+                        "phone",
+
+                        "service_type"
+
+                    ]
+                ]
             )
 
-        # =================================================
-        # DURATION
-        # =================================================
-        if arrival and complete:
 
-            fmt = "%I:%M:%S %p"
+# =========================================================
+# REPORTS
+# =========================================================
+with tab4:
 
-            try:
+    st.header("📊 Reports")
+    st.subheader("Application Diagnostics")
 
-                start = datetime.strptime(
-                    arrival,
-                    fmt
-                )
+    app_count = pd.read_sql_query(
+        """
+        SELECT COUNT(*) AS total
+        FROM applications
+        """,
+        conn
+    )
 
-                end = datetime.strptime(
-                    complete,
-                    fmt
-                )
+    st.write("Application Count")
+    st.dataframe(app_count)
 
-                duration = (
-                    end - start
-                ).total_seconds() / 60
+    duplicate_check = pd.read_sql_query(
+        """
+        SELECT
+            customer_name,
+            service_date,
+            COUNT(*) AS cnt
+        FROM applications
+        GROUP BY
+            customer_name,
+            service_date
+        HAVING COUNT(*) > 1
+        ORDER BY cnt DESC
+        LIMIT 20
+        """,
+        conn
+    )
 
-                st.metric(
-                    f"Stop {i+1} Duration",
-                    f"{int(duration)} min"
-                )
+    st.write("Potential Duplicate Records")
 
-            except:
-                pass
+    st.dataframe(duplicate_check)
 
-        st.divider()
+    st.subheader("🌱 Herbicides")
 
-    # =====================================================
-    # PERFORMANCE
-    # =====================================================
-    st.subheader("📊 Route Performance")
+    herb_df = pd.read_sql_query(
+        """
+        SELECT *
+        FROM herbicides
+        ORDER BY product_name
+        """,
+        conn
+    )
+
+    st.dataframe(
+        herb_df,
+        use_container_width=True
+    )
+
+    herbicide_count = pd.read_sql_query(
+    """
+    SELECT COUNT(*) AS total
+    FROM herbicides
+    """,
+    conn
+    )
 
     st.metric(
-        "Completed Stops",
-        len(st.session_state.completed)
+        "Herbicides",
+        herbicide_count.iloc[0]["total"]
     )
+
+    # =====================================================
+    # CUSTOMER COUNT
+    # =====================================================
+    customer_df = pd.read_sql_query(
+        """
+        SELECT *
+        FROM customers
+        """,
+        conn
+    )
+    st.write(f"Rows loaded: {len(customer_df)}")
+    st.dataframe(customer_df.head())
+    st.write(
+        f"Actual rows in customers table: {len(customer_df)}"
+    )
+
+    # =====================================================
+    # APPLICATION COUNT
+    # =====================================================
+    total_apps = pd.read_sql_query("""
+
+    SELECT COUNT(*) AS total
+    FROM applications
+
+    """, conn).iloc[0]["total"]
+
+    st.metric(
+        "Total Applications",
+        total_apps
+    )
+
+    if st.button("Clear Applications Table"):
+
+        cursor.execute(
+            "DELETE FROM applications"
+    )
+
+    conn.commit()
+
+    st.success("Applications table cleared")
+    # =====================================================
+    # APPLICATION HISTORY
+    # =====================================================
+    st.subheader("Application History")
+
+    history_df = pd.read_sql_query("""
+
+    SELECT *
+    FROM applications
+    ORDER BY service_date DESC
+
+    """, conn)
+
+    st.dataframe(
+        history_df,
+        use_container_width=True
+    )
+
+    st.download_button(
+
+        "📥 Download Application History CSV",
+
+        history_df.to_csv(index=False),
+
+        "application_history.csv",
+
+        "text/csv"
+
+    )
+    

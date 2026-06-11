@@ -1,0 +1,647 @@
+# =========================================================
+# app.py
+# FULL CRM + DISPATCH + SQLITE IMPORT FOUNDATION
+# =========================================================
+
+import streamlit as st
+import pandas as pd
+import sqlite3
+import requests
+import json
+import os
+import re
+import time
+
+from urllib.parse import quote
+from datetime import datetime
+
+
+# =========================================================
+# PAGE CONFIG
+# =========================================================
+st.set_page_config(
+    page_title="Time Out Lawncare CRM",
+    page_icon="🌿",
+    layout="wide"
+)
+
+st.title("🌿 Time Out Lawncare CRM + Dispatch")
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+DB_FILE = "crm.db"
+
+conn = sqlite3.connect(
+    DB_FILE,
+    check_same_thread=False
+)
+
+cursor = conn.cursor()
+
+
+# =========================================================
+# CREATE TABLES
+# =========================================================
+cursor.execute("""
+
+CREATE TABLE IF NOT EXISTS customers (
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    customer_name TEXT,
+
+    address TEXT,
+
+    city TEXT,
+
+    state TEXT,
+
+    zip TEXT,
+
+    phone TEXT,
+
+    email TEXT,
+
+    notes TEXT,
+
+    service_type TEXT,
+
+    lawn_sqft REAL,
+
+    price REAL,
+
+    lat REAL,
+
+    lon REAL,
+
+    active INTEGER DEFAULT 1
+)
+
+""")
+
+cursor.execute("""
+
+CREATE TABLE IF NOT EXISTS applications (
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    customer_name TEXT,
+
+    service_date TEXT,
+
+    applicator TEXT,
+
+    treatment_type TEXT,
+
+    lawn_sqft REAL,
+
+    product_name TEXT,
+
+    application_rate TEXT,
+
+    quantity_used TEXT,
+
+    notes TEXT
+)
+
+""")
+
+cursor.execute("""
+
+CREATE TABLE IF NOT EXISTS services (
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    service_name TEXT,
+
+    price REAL
+)
+
+""")
+
+cursor.execute("""
+
+CREATE TABLE IF NOT EXISTS chemicals (
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    product_name TEXT,
+
+    chemical_type TEXT,
+
+    cost REAL,
+
+    application_rate TEXT
+)
+
+""")
+
+conn.commit()
+
+
+# =========================================================
+# GOOGLE API
+# =========================================================
+GOOGLE_API_KEY = st.secrets.get(
+    "GOOGLE_API_KEY",
+    ""
+)
+
+
+# =========================================================
+# GEOCODING
+# =========================================================
+def clean_address(addr):
+
+    if pd.isna(addr):
+        return ""
+
+    addr = str(addr).strip()
+
+    addr = re.sub(
+        r"\s+",
+        " ",
+        addr
+    )
+
+    return addr
+
+
+def geocode(address):
+
+    if not GOOGLE_API_KEY:
+        return None, None
+
+    try:
+
+        url = (
+            "https://maps.googleapis.com/maps/api/geocode/json"
+            f"?address={quote(address)}"
+            f"&key={GOOGLE_API_KEY}"
+        )
+
+        response = requests.get(
+            url,
+            timeout=10
+        ).json()
+
+        if response["status"] == "OK":
+
+            loc = response["results"][0]["geometry"]["location"]
+
+            return loc["lat"], loc["lng"]
+
+    except:
+        pass
+
+    return None, None
+
+
+# =========================================================
+# TABS
+# =========================================================
+tab1, tab2, tab3, tab4 = st.tabs([
+
+    "📥 Import Workbook",
+
+    "👥 CRM",
+
+    "🚚 Dispatch",
+
+    "📊 Reports"
+
+])
+
+
+# =========================================================
+# IMPORT WORKBOOK
+# =========================================================
+with tab1:
+
+    st.header("📥 Import Existing Workbook")
+
+    uploaded = st.file_uploader(
+        "Upload Excel Workbook",
+        type=["xlsx"]
+    )
+
+    if uploaded:
+
+        workbook = pd.ExcelFile(uploaded)
+
+        st.success(
+            f"Workbook loaded with "
+            f"{len(workbook.sheet_names)} sheets"
+        )
+
+        st.subheader("Workbook Sheets")
+
+        if uploaded:
+
+            for sheet in workbook.sheet_names:
+
+                st.write(sheet)
+
+        # DEBUG
+        #  st.subheader("DEBUG")
+
+         # if uploaded and "Applications" in workbook.sheet_names:
+            #  st.success("Applications sheet found")
+       #   else:
+            #  st.error("Applications sheet NOT found")
+
+        # =================================================
+        # IMPORT CUSTOMERS
+        # =================================================
+
+        if "Customer_Data" in workbook.sheet_names:
+
+            customer_df = pd.read_excel(
+                workbook,
+                sheet_name="Customer_Data"
+            )
+
+            st.subheader("Customer_Data Preview")
+
+            st.dataframe(
+                customer_df.head()
+            )
+
+            if st.button("Import Customers"):
+
+                imported = 0
+
+                for _, row in customer_df.iterrows():
+
+                    try:
+                        # your existing customer import code here
+                        imported += 1
+
+                    except Exception as e:
+                        st.warning(f"Skipped row: {e}")
+
+                conn.commit()
+
+                st.success(
+                    f"Imported {imported} customers"
+                )
+
+        # =================================================
+        # IMPORT APPLICATIONS
+        # =================================================
+
+        application_sheet = None
+
+        if uploaded:
+
+            for sheet in workbook.sheet_names:
+
+            if sheet.strip().lower() == "applications":
+
+                application_sheet = sheet
+                break
+
+        if application_sheet:
+
+            st.success(
+                f"Found application sheet: {application_sheet}"
+            )
+
+            app_df = pd.read_excel(
+                workbook,
+                sheet_name=application_sheet
+            )
+
+            st.subheader(
+                f"{application_sheet} Preview"
+            )
+
+            st.dataframe(
+                app_df.head()
+            )
+
+            if st.button("Import Applications"):
+
+                imported = 0
+
+                for _, row in app_df.iterrows():
+
+                    try:
+
+                        cursor.execute(
+                            """
+                            INSERT INTO applications (
+
+                                customer_name,
+                                service_date,
+                                applicator,
+                                treatment_type,
+                                lawn_sqft,
+                                product_name,
+                                application_rate,
+                                quantity_used,
+                                notes
+
+                            )
+
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                str(row.get("Customer", "")),
+                                str(row.get("Date", "")),
+                                str(row.get("Applicator", "")),
+                                str(row.get("Treatment", "")),
+                                row.get("Sq Ft", None),
+                                str(row.get("Product", "")),
+                                str(row.get("Rate", "")),
+                                str(row.get("Quantity", "")),
+                                str(row.get("Notes", ""))
+                            )
+                        )
+
+                        imported += 1
+
+                    except Exception as e:
+
+                        st.warning(
+                            f"Skipped row: {e}"
+                        )
+
+                conn.commit()
+
+                st.success(
+                    f"Imported {imported} applications"
+                )
+# =========================================================
+# CRM
+# =========================================================
+with tab2:
+
+    st.header("👥 Customer CRM")
+
+    customer_df = pd.read_sql_query(
+        "SELECT * FROM customers",
+        conn
+    )
+
+    search = st.text_input(
+        "Search Customers"
+    )
+
+    if search:
+
+        customer_df = customer_df[
+            customer_df["customer_name"]
+            .str.contains(
+                search,
+                case=False,
+                na=False
+            )
+        ]
+
+    st.dataframe(
+        customer_df,
+       use_container_width=True
+    )
+
+    st.subheader("➕ Add Customer")
+
+    with st.form("add_customer"):
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+
+            name = st.text_input(
+                "Customer Name"
+            )
+
+            address = st.text_input(
+                "Address"
+            )
+
+            city = st.text_input(
+                "City"
+            )
+
+            state = st.text_input(
+                "State",
+                value="MS"
+            )
+
+        with c2:
+
+            zip_code = st.text_input(
+                "Zip"
+            )
+
+            phone = st.text_input(
+                "Phone"
+            )
+
+            email = st.text_input(
+                "Email"
+            )
+
+            lawn_sqft = st.number_input(
+                "Lawn Sq Ft",
+                min_value=0.0
+            )
+
+        notes = st.text_area(
+            "Notes"
+        )
+
+        submitted = st.form_submit_button(
+            "Add Customer"
+        )
+
+        if submitted:
+
+            full_address = (
+                f"{address}, "
+                f"{city}, "
+                f"{state} "
+                f"{zip_code}"
+            )
+
+            lat, lon = geocode(
+                full_address
+            )
+
+            cursor.execute("""
+
+            INSERT INTO customers (
+
+                customer_name,
+                address,
+                city,
+                state,
+                zip,
+                phone,
+                email,
+                notes,
+                lawn_sqft,
+                lat,
+                lon
+
+            )
+
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+            """, (
+
+                name,
+                address,
+                city,
+                state,
+                zip_code,
+                phone,
+                email,
+                notes,
+                lawn_sqft,
+                lat,
+                lon
+
+            ))
+
+            conn.commit()
+
+            st.success(
+                "Customer added"
+            )
+
+            st.rerun()
+
+
+# =========================================================
+# DISPATCH
+# =========================================================
+with tab3:
+
+    st.header("🚚 Dispatch Generator")
+
+    dispatch_df = pd.read_sql_query("""
+
+    SELECT *
+    FROM customers
+    WHERE active = 1
+
+    """, conn)
+
+    dispatch_df["Include"] = False
+
+    edited = st.data_editor(
+        dispatch_df,
+        use_container_width=True
+    )
+
+    selected = edited[
+        edited["Include"] == True
+    ]
+
+    st.info(
+        f"{len(selected)} customers selected"
+    )
+
+    if st.button("Generate Route"):
+
+        if len(selected) == 0:
+
+            st.warning(
+                "No customers selected"
+            )
+
+        else:
+
+            st.success(
+                "Route generation module ready"
+            )
+
+            st.dataframe(
+                selected[
+                    [
+
+                        "customer_name",
+
+                        "address",
+
+                        "city",
+
+                        "phone",
+
+                        "service_type"
+
+                    ]
+                ]
+            )
+
+
+# =========================================================
+# REPORTS
+# =========================================================
+with tab4:
+
+    st.header("📊 Reports")
+
+    # =====================================================
+    # CUSTOMER COUNT
+    # =====================================================
+    total_customers = pd.read_sql_query("""
+
+    SELECT COUNT(*) AS total
+    FROM customers
+
+    """, conn).iloc[0]["total"]
+
+    st.metric(
+        "Total Customers",
+        total_customers
+    )
+
+    # =====================================================
+    # APPLICATION COUNT
+    # =====================================================
+    total_apps = pd.read_sql_query("""
+
+    SELECT COUNT(*) AS total
+    FROM applications
+
+    """, conn).iloc[0]["total"]
+
+    st.metric(
+        "Total Applications",
+        total_apps
+    )
+
+    # =====================================================
+    # APPLICATION HISTORY
+    # =====================================================
+    st.subheader("Application History")
+
+    history_df = pd.read_sql_query("""
+
+    SELECT *
+    FROM applications
+    ORDER BY service_date DESC
+
+    """, conn)
+
+    st.dataframe(
+        history_df,
+        use_container_width=True
+    )
+
+    st.download_button(
+
+        "📥 Download Application History CSV",
+
+        history_df.to_csv(index=False),
+
+        "application_history.csv",
+
+        "text/csv"
+
+    )
