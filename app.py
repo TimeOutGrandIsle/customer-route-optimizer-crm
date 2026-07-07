@@ -35,6 +35,59 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+if not st.user.is_logged_in:
+
+    st.title("Time Out Lawncare CRM")
+
+    st.info(
+        "Sign in with an authorized Google account."
+    )
+
+    if st.button(
+        "Sign in",
+        type="primary",
+    ):
+        st.login()
+
+    st.stop()
+
+
+allowed_users = {
+    email.strip().casefold()
+    for email in st.secrets.get(
+        "ALLOWED_USERS",
+        []
+    )
+}
+
+current_email = str(
+    st.user.get("email", "")
+).strip().casefold()
+
+if current_email not in allowed_users:
+
+    st.error(
+        "This Google account is not authorized."
+    )
+
+    if st.button("Sign out"):
+        st.logout()
+
+    st.stop()
+
+
+with st.sidebar:
+
+    st.write(
+        f"Signed in as {current_email}"
+    )
+
+    if st.button(
+        "Sign out",
+        key="security_logout",
+    ):
+        st.logout()
+
 # ---------------------------------------------------------
 # DATABASE
 # ---------------------------------------------------------
