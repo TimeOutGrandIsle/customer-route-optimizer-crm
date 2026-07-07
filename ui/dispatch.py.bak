@@ -1,0 +1,543 @@
+# Time Out Lawncare CRM
+# Dispatch Engine
+# Version 2.0
+#
+
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+
+from core.crm import (
+    list_dispatch_jobs,
+    optimize_dispatch_route,
+    get_depot,
+)
+
+from data.database import (
+    get_dispatch_jobs,
+    update_dispatch_status,
+)
+
+from services.routing import (
+    build_dispatch_route,
+    build_multi_crew_routes,
+    driver_manifest,
+    route_summary,
+    route_dataframe,
+)
+
+# =========================
+# SESSION STATE HELPERS (Streamlit-friendly)
+# =========================
+# ==========================================================
+# DATABASE HELPERS
+# ==========================================================
+
+def get_dispatch_queue() -> List[Dict[str, Any]]:
+    """
+    Returns queued jobs as dictionaries.
+    """
+
+    df = list_dispatch_jobs(status="queued")
+
+    if df.empty:
+        return []
+
+    return df.to_dict("records")
+
+
+def get_all_dispatch_jobs() -> List[Dict[str, Any]]:
+    """
+    Returns every dispatch job.
+    """
+
+    df = list_dispatch_jobs()
+
+    if df.empty:
+        return []
+
+    return df.to_dict("records")
+
+# =========================
+# QUEUE MANAGEMENT
+# =========================
+def add_to_queue(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Adds metadata wrapper around a job for UI usage.
+    """
+    job["added_at"] = datetime.now().isoformat()
+    job["status_local"] = "queued_ui"
+    return job
+
+
+def build_queue_from_customers(customers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Converts customer list into dispatch queue format.
+    """
+    queue = []
+    for c in customers:
+        queue.append({
+            "customer_id": c.get("id"),
+            "name": c.get("name"),
+            "address": c.get("address"),
+            "lat": c.get("lat"),
+            "lng": c.get("lng"),
+            "service": c.get("service"),
+            "status": "queued"
+        })
+    return queue
+
+
+def clear_queue() -> None:
+    """
+    Marks all queued jobs as cancelled in DB.
+    """
+    jobs = get_dispatch_jobs(status="queued")
+
+    if jobs is None or jobs.empty:
+        return
+
+    for _, row in jobs.iterrows():
+        update_dispatch_status(row["id"], "cancelled")
+
+
+# ==========================================================
+# ROUTE BUILDING
+# ==========================================================
+
+def build_daily_route() -> List[Dict[str, Any]]:
+    """
+    Returns today's optimized route from queued jobs.
+    """
+
+    return optimize_dispatch_route()
+
+
+def build_route_from_queue(
+    queue: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Builds an optimized route from an in-memory queue.
+    """
+
+    if not queue:
+        return []
+
+    depot = get_depot()
+
+    if not depot.get("lat"):
+        depot = {
+            "name": "Time Out Lawncare",
+            "address": "Brandon, MS",
+            "lat": 32.2737,
+            "lng": -89.9865,
+        }
+
+    return build_dispatch_route(
+        depot,
+        queue,
+    )
+
+
+def build_driver_manifest() -> List[Dict[str, Any]]:
+    """
+    Creates a printable driver manifest for today's route.
+    """
+
+    route = build_daily_route()
+
+    if not route:
+        return []
+
+    return driver_manifest(route)
+
+
+def build_dispatch_summary() -> Dict[str, Any]:
+    """
+    Returns route statistics for today's work.
+    """
+
+    route = build_daily_route()
+
+    if not route:
+        return {
+            "stops": 0,
+            "distance_miles": 0,
+            "drive_minutes": 0,
+            "service_minutes": 0,
+            "total_minutes": 0,
+            "google_maps": "",
+        }
+
+    return route_summary(route)
+
+
+def build_dispatch_dataframe() -> pd.DataFrame:
+    """
+    Driver-friendly DataFrame.
+    """
+
+    route = build_daily_route()
+
+    if not route:
+        return pd.DataFrame()
+
+    return route_dataframe(route)
+
+
+def build_multi_driver_routes(
+    crews: int = 2,
+):
+    """
+    Splits queued work between multiple crews.
+    """
+
+    jobs = get_dispatch_queue()
+
+    if not jobs:
+        return []
+
+    depot = get_depot()
+
+    if not depot.get("lat"):
+        depot = {
+            "name": "Time Out Lawncare",
+            "address": "Brandon, MS",
+            "lat": 32.2737,
+            "lng": -89.9865,
+        }
+
+    return build_multi_crew_routes(
+        depot,
+        jobs,
+        crews,
+    )
+
+
+# ==========================================================
+# DISPATCH STATUS
+# ==========================================================
+
+def mark_job_complete(
+    job_id: int,
+):
+    update_dispatch_status(
+        job_id,
+        "completed",
+    )
+
+
+def mark_job_in_progress(
+    job_id: int,
+):
+    update_dispatch_status(
+        job_id,
+        "in_progress",
+    )
+
+
+def mark_job_cancelled(
+    job_id: int,
+):
+    update_dispatch_status(
+        job_id,
+        "cancelled",
+    )
+
+
+def cancel_entire_queue():
+    """
+    Cancels every queued dispatch job.
+    """
+
+    jobs = get_dispatch_queue()
+
+    for job in jobs:
+
+        update_dispatch_status(
+            job["id"],
+            "cancelled",
+        )
+
+
+def complete_entire_queue():
+    """
+    Marks today's queue complete.
+    """
+
+    jobs = get_dispatch_queue()
+
+    for job in jobs:
+
+        update_dispatch_status(
+            job["id"],
+            "completed",
+        )
+
+
+# ==========================================================
+# DRIVER VIEW
+# ==========================================================
+
+def get_driver_route_view() -> List[Dict[str, Any]]:
+    """
+    Driver-friendly view of today's route.
+    """
+
+    route = build_daily_route()
+
+    if not route:
+        return []
+
+    driver_view = []
+
+    for stop in route:
+
+        driver_view.append({
+
+            "stop":
+
+                stop.get(
+                    "stop_number",
+                    0,
+                ),
+
+            "customer":
+
+                stop.get(
+                    "name",
+                    "",
+                ),
+
+            "address":
+
+                stop.get(
+                    "address",
+                    "",
+                ),
+
+            "service":
+
+                stop.get(
+                    "service",
+                    "",
+                ),
+
+            "arrival_minutes":
+
+                stop.get(
+                    "arrival_minutes",
+                    0,
+                ),
+
+            "drive_minutes":
+
+                stop.get(
+                    "drive_minutes",
+                    0,
+                ),
+
+            "distance_miles":
+
+                stop.get(
+                    "distance_miles",
+                    0,
+                ),
+
+            "notes":
+
+                stop.get(
+                    "notes",
+                    "",
+                ),
+
+        })
+
+    return driver_view
+
+
+def next_stop(
+    route: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Returns the next customer stop.
+    """
+
+    if not route:
+        return None
+
+    for stop in route:
+
+        if stop.get("stop_number", 0) == 0:
+            continue
+
+        if stop.get("completed", False):
+            continue
+
+        return stop
+
+    return None
+
+
+def remaining_stops(
+    route: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+
+    return [
+
+        stop
+
+        for stop in route
+
+        if (
+            stop.get("stop_number", 0) > 0
+            and
+            not stop.get("completed", False)
+        )
+
+    ]
+
+
+# ==========================================================
+# ANALYTICS
+# ==========================================================
+
+def dispatch_statistics() -> Dict[str, Any]:
+    """
+    Dashboard statistics.
+    """
+
+    jobs = get_all_dispatch_jobs()
+
+    queued = 0
+    progress = 0
+    complete = 0
+    cancelled = 0
+
+    for job in jobs:
+
+        status = job.get(
+            "status",
+            "",
+        )
+
+        if status == "queued":
+            queued += 1
+
+        elif status == "in_progress":
+            progress += 1
+
+        elif status == "completed":
+            complete += 1
+
+        elif status == "cancelled":
+            cancelled += 1
+
+    summary = build_dispatch_summary()
+
+    return {
+
+        "queued":
+
+            queued,
+
+        "in_progress":
+
+            progress,
+
+        "completed":
+
+            complete,
+
+        "cancelled":
+
+            cancelled,
+
+        "route":
+
+            summary,
+
+    }
+
+
+def dispatch_dashboard() -> Dict[str, Any]:
+    """
+    Returns everything needed by the Dispatch tab.
+    """
+
+    return {
+
+        "jobs":
+
+            get_dispatch_queue(),
+
+        "route":
+
+            build_daily_route(),
+
+        "manifest":
+
+            build_driver_manifest(),
+
+        "summary":
+
+            build_dispatch_summary(),
+
+        "statistics":
+
+            dispatch_statistics(),
+
+        "dataframe":
+
+            build_dispatch_dataframe(),
+
+    }
+
+
+# ==========================================================
+# EXPORTS
+# ==========================================================
+
+__all__ = [
+
+    "get_dispatch_queue",
+
+    "get_all_dispatch_jobs",
+
+    "build_daily_route",
+
+    "build_route_from_queue",
+
+    "build_driver_manifest",
+
+    "build_dispatch_summary",
+
+    "build_dispatch_dataframe",
+
+    "build_multi_driver_routes",
+
+    "mark_job_complete",
+
+    "mark_job_in_progress",
+
+    "mark_job_cancelled",
+
+    "cancel_entire_queue",
+
+    "complete_entire_queue",
+
+    "get_driver_route_view",
+
+    "next_stop",
+
+    "remaining_stops",
+
+    "dispatch_statistics",
+
+    "dispatch_dashboard",
+
+]

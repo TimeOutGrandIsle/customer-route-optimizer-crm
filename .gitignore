@@ -1,0 +1,35 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Secrets
+.streamlit/secrets.toml
+.env
+.env.*
+!.env.example
+notes.txt
+
+# Customer and business data
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.xlsx
+*.xlsm
+*.xls
+~$*
+
+# Generated/private caches
+geocode_cache.json
+geo_cache.json
+last_dispatch.json
+temp_*
+*.log
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
