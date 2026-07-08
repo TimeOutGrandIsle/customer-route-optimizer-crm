@@ -15,6 +15,8 @@ from core.crm import initialize_system
 
 from datetime import date
 
+from data.database import update_customer
+
 from tabs.import_data import render as render_import_data
 
 from ui.dispatch import (
@@ -467,13 +469,340 @@ with tab_customers:
         f"Customers Found: {len(customer_df)}"
     )
 
+    customer_display_df = customer_df.drop(
+        columns=[
+            "street_address",
+            "city",
+            "state",
+            "zip",
+            "county",
+        ],
+        errors="ignore",
+    )
+
     st.dataframe(
-        customer_df,
+        customer_display_df,
         use_container_width=True,
         hide_index=True,
     )
 
     st.divider()
+
+    st.subheader("Edit Customer")
+
+    if customers.empty:
+
+        st.info("No customers are available to edit.")
+
+    else:
+
+        def customer_value(row, field, default=""):
+            value = row.get(field, default)
+            return default if pd.isna(value) else value
+
+        customer_options = (
+            customers["id"].astype(int).tolist()
+        )
+
+        customer_labels = {
+            int(row["id"]): (
+                f"{row['name']} — "
+                f"{customer_value(row, 'customer_number')}"
+            ).rstrip(" —")
+            for _, row in customers.iterrows()
+        }
+
+        edit_customer_id = st.selectbox(
+            "Choose Customer",
+            options=customer_options,
+            format_func=lambda value: (
+                customer_labels[value]
+            ),
+            key="edit_customer_selection",
+        )
+
+        selected_customer = customers[
+            customers["id"] == edit_customer_id
+        ].iloc[0]
+
+        with st.form("edit_customer_form"):
+
+            c1, c2 = st.columns(2)
+
+            customer_name = c1.text_input(
+                "Customer Name",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "name",
+                    )
+                ),
+            )
+
+            customer_number = c2.text_input(
+                "Customer Number",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "customer_number",
+                    )
+                ),
+            )
+
+            street_address = st.text_input(
+                "Street Address",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "street_address",
+                    )
+                ),
+            )
+
+            city_col, state_col, zip_col = (
+                st.columns([2, 1, 1])
+            )
+
+            city = city_col.text_input(
+                "City",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "city",
+                    )
+                ),
+            )
+
+            state = state_col.text_input(
+                "State",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "state",
+                    )
+                ),
+            )
+
+            zipcode = zip_col.text_input(
+                "ZIP",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "zip",
+                    )
+                ),
+            )
+
+            county = st.text_input(
+                "County",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "county",
+                    )
+                ),
+            )
+
+            phone_col, email_col = st.columns(2)
+
+            phone = phone_col.text_input(
+                "Phone Number",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "phone",
+                    )
+                ),
+            )
+
+            email = email_col.text_input(
+                "Email Address",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "email",
+                    )
+                ),
+            )
+
+            text_phone = st.text_input(
+                "Text Address",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "text_phone",
+                    )
+                ),
+            )
+
+            area_col, quote_col = st.columns(2)
+
+            square_feet = area_col.number_input(
+                "Square Feet",
+                min_value=0.0,
+                value=float(
+                    customer_value(
+                        selected_customer,
+                        "square_feet",
+                        0,
+                    )
+                    or 0
+                ),
+            )
+
+            quote = quote_col.number_input(
+                "Quote",
+                min_value=0.0,
+                value=float(
+                    customer_value(
+                        selected_customer,
+                        "quote",
+                        0,
+                    )
+                    or 0
+                ),
+                format="%.2f",
+            )
+
+            turf_col, irrigation_col = (
+                st.columns(2)
+            )
+
+            turf_type = turf_col.text_input(
+                "Turf Type",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "turf_type",
+                    )
+                ),
+            )
+
+            irrigation = irrigation_col.text_input(
+                "Irrigation",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "irrigation",
+                    )
+                ),
+            )
+
+            payment_method = st.text_input(
+                "Payment Method",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "payment_method",
+                    )
+                ),
+            )
+
+            notes = st.text_area(
+                "Notes",
+                value=str(
+                    customer_value(
+                        selected_customer,
+                        "special_instructions",
+                    )
+                ),
+            )
+
+            active = st.checkbox(
+                "Active Customer",
+                value=bool(
+                    customer_value(
+                        selected_customer,
+                        "active",
+                        1,
+                    )
+                ),
+            )
+
+            save_customer = (
+                st.form_submit_button(
+                    "Save Customer Changes",
+                    type="primary",
+                    use_container_width=True,
+                )
+            )
+
+            if save_customer:
+
+                if not customer_name.strip():
+
+                    st.error(
+                        "Customer name is required."
+                    )
+
+                else:
+
+                    full_address = ", ".join(
+                        part.strip()
+                        for part in [
+                            street_address,
+                            city,
+                            state,
+                            zipcode,
+                        ]
+                        if part.strip()
+                    )
+
+                    try:
+
+                        update_customer(
+                            edit_customer_id,
+                            customer_number=(
+                                customer_number.strip()
+                                or None
+                            ),
+                            name=customer_name.strip(),
+                            address=full_address,
+                            street_address=(
+                                street_address.strip()
+                            ),
+                            city=city.strip(),
+                            state=state.strip(),
+                            zip=zipcode.strip(),
+                            county=county.strip(),
+                            phone=phone.strip(),
+                            email=email.strip(),
+                            text_phone=(
+                                text_phone.strip()
+                            ),
+                            square_feet=square_feet,
+                            turf_type=turf_type.strip(),
+                            irrigation=(
+                                irrigation.strip()
+                            ),
+                            payment_method=(
+                                payment_method.strip()
+                            ),
+                            quote=quote,
+                            special_instructions=(
+                                notes.strip()
+                            ),
+                            active=int(active),
+                        )
+
+                    except Exception as exc:
+
+                        st.error(
+                            "Customer could not be "
+                            f"updated: {exc}"
+                        )
+
+                    else:
+
+                        st.success(
+                            "Customer updated "
+                            "successfully."
+                        )
+
+                        st.rerun()
+
+    st.divider()
+
 
     st.subheader(
         "Quick Add Customer"

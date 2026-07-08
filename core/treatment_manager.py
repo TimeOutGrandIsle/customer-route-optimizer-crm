@@ -961,6 +961,77 @@ def complete_treatment_event(
         notes=notes,
     )
 
+def record_manual_application(
+    customer_id: int,
+    treatment_id: int,
+    application_date: date | str,
+    notes: str = "",
+    actual_amounts: Dict[int, float] | None = None,
+    applicator_employee_id: int | None = None,
+) -> int:
+    """Record an application completed outside Dispatch."""
+    applied_date = (
+        pd.to_datetime(application_date)
+        .date()
+        .isoformat()
+    )
+
+    matches = dataframe(
+        """
+        SELECT id, status
+        FROM treatment_events
+        WHERE customer_id=?
+          AND treatment_id=?
+          AND due_date=?
+        """,
+        (
+            int(customer_id),
+            int(treatment_id),
+            applied_date,
+        ),
+    )
+
+    if not matches.empty:
+        event = matches.iloc[0]
+
+        if str(event["status"]) == "completed":
+            raise ValueError(
+                "This customer already has this treatment "
+                "recorded on the selected date."
+            )
+
+        event_id = int(event["id"])
+
+    else:
+        event_id = execute(
+            """
+            INSERT INTO treatment_events (
+                customer_id,
+                treatment_id,
+                due_date,
+                status,
+                event_type,
+                notes
+            )
+            VALUES (?, ?, ?, 'planned', 'manual', ?)
+            """,
+            (
+                int(customer_id),
+                int(treatment_id),
+                applied_date,
+                notes,
+            ),
+        )
+
+    complete_treatment_event(
+        event_id=event_id,
+        notes=notes,
+        application_date=applied_date,
+        actual_amounts=actual_amounts,
+        applicator_employee_id=applicator_employee_id,
+    )
+
+    return event_id
 
 def calculate_mixture(
     treatment_id: int,

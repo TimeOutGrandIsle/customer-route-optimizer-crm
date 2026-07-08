@@ -15,18 +15,289 @@ from core.compliance_reports import (
     get_application_report,
 )
 
+from core.treatment_manager import (
+    get_active_applicators,
+    get_treatment_definitions,
+    get_treatment_products,
+    record_manual_application,
+)
+
+from data.database import get_customers
 
 def render(current_email: str):
 
     st.header("Applications")
 
-    history_tab, correction_tab, audit_tab = st.tabs(
+    add_tab, history_tab, correction_tab, audit_tab = st.tabs(
         [
+            "Add Application",
             "Application History",
             "Correct Application",
             "Correction Audit",
         ]
     )
+
+    # ======================================================
+    # ADD APPLICATION
+    # ======================================================
+
+    with add_tab:
+
+        st.subheader("Add Completed Application")
+
+        st.caption(
+            "Use this for work completed outside "
+            "the Dispatch workflow."
+        )
+
+        customers = get_customers(active_only=True)
+
+        treatments = get_treatment_definitions(
+            active_only=True
+        )
+
+        applicators = get_active_applicators()
+
+        if customers.empty:
+
+            st.info(
+                "Add an active customer before "
+                "recording an application."
+            )
+
+        elif treatments.empty:
+
+            st.info(
+                "Add an active treatment type before "
+                "recording an application."
+            )
+
+        else:
+
+            customer_labels = {
+                int(row["id"]): (
+                    f"{row['name']} — "
+                    f"{row.get('address', '')}"
+                ).rstrip(" —")
+                for _, row in customers.iterrows()
+            }
+
+            treatment_labels = {
+                int(row["id"]): str(row["name"])
+                for _, row in treatments.iterrows()
+            }
+
+            customer_id = st.selectbox(
+                "Customer",
+                options=list(customer_labels),
+                format_func=lambda value: (
+                    customer_labels[value]
+                ),
+                key="manual_application_customer",
+            )
+
+            treatment_id = st.selectbox(
+                "Treatment",
+                options=list(treatment_labels),
+                format_func=lambda value: (
+                    treatment_labels[value]
+                ),
+                key="manual_application_treatment",
+            )
+
+            selected_customer = customers[
+                customers["id"] == customer_id
+            ].iloc[0]
+
+            square_feet = float(
+                selected_customer.get(
+                    "square_feet",
+                    0,
+                )
+                or 0
+            )
+
+            acres = square_feet / 43560.0
+
+            st.caption(
+                f"Treatment area: {square_feet:,.0f} "
+                f"sq ft ({acres:.3f} acres)"
+            )
+
+            chemicals = get_treatment_products(
+                treatment_id
+            )
+
+            chemical_rows = []
+
+            for _, chemical in chemicals.iterrows():
+
+                rate = float(
+                    chemical["rate_per_acre"]
+                    or 0
+                )
+
+                calculated = rate * acres
+
+                chemical_rows.append(
+                    {
+                        "product_id": int(
+                            chemical["product_id"]
+                        ),
+                        "Chemical": chemical[
+                            "product_name"
+                        ],
+                        "EPA Number": chemical[
+                            "epa_number"
+                        ],
+                        "Rate Per Acre": rate,
+                        "Unit": chemical[
+                            "rate_unit"
+                        ],
+                        "Calculated Total": round(
+                            calculated,
+                            4,
+                        ),
+                        "Actual Total": round(
+                            calculated,
+                            4,
+                        ),
+                    }
+                )
+
+            with st.form(
+                "add_manual_application_form"
+            ):
+
+                application_date = st.date_input(
+                    "Application Date",
+                    value=date.today(),
+                )
+
+                applicator_options = [None]
+
+                applicator_labels = {
+                    None: "Not specified"
+                }
+
+                for _, applicator in (
+                    applicators.iterrows()
+                ):
+
+                    employee_id = int(
+                        applicator["id"]
+                    )
+
+                    applicator_options.append(
+                        employee_id
+                    )
+
+                    applicator_labels[
+                        employee_id
+                    ] = str(applicator["name"])
+
+                applicator_id = st.selectbox(
+                    "Applicator",
+                    options=applicator_options,
+                    format_func=lambda value: (
+                        applicator_labels[value]
+                    ),
+                )
+
+                if chemical_rows:
+
+                    actual_chemicals = st.data_editor(
+                        pd.DataFrame(
+                            chemical_rows
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                        disabled=[
+                            "product_id",
+                            "Chemical",
+                            "EPA Number",
+                            "Rate Per Acre",
+                            "Unit",
+                            "Calculated Total",
+                        ],
+                        column_config={
+                            "product_id": None,
+                            "Actual Total": (
+                                st.column_config
+                                .NumberColumn(
+                                    "Actual Total",
+                                    min_value=0.0,
+                                    format="%.4f",
+                                )
+                            ),
+                        },
+                    )
+
+                else:
+
+                    actual_chemicals = (
+                        pd.DataFrame()
+                    )
+
+                    st.warning(
+                        "This treatment has no "
+                        "chemicals assigned."
+                    )
+
+                notes = st.text_area(
+                    "Application Notes",
+                    placeholder=(
+                        "Weather, turf conditions, "
+                        "observations..."
+                    ),
+                )
+
+                save_application = (
+                    st.form_submit_button(
+                        "Save Application",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                )
+
+                if save_application:
+
+                    actual_amounts = {
+                        int(row["product_id"]): float(
+                            row["Actual Total"]
+                        )
+                        for _, row
+                        in actual_chemicals.iterrows()
+                    }
+
+                    try:
+
+                        record_manual_application(
+                            customer_id=customer_id,
+                            treatment_id=treatment_id,
+                            application_date=(
+                                application_date
+                            ),
+                            notes=notes,
+                            actual_amounts=(
+                                actual_amounts
+                            ),
+                            applicator_employee_id=(
+                                applicator_id
+                            ),
+                        )
+
+                    except ValueError as exc:
+
+                        st.error(str(exc))
+
+                    else:
+
+                        st.success(
+                            "Application saved."
+                        )
+
+                        st.rerun()
 
     # ======================================================
     # HISTORY

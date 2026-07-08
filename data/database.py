@@ -151,6 +151,8 @@ def init_db():
             irrigation TEXT,
 
             payment_method TEXT,
+            
+            quote REAL,
 
             active INTEGER DEFAULT 1,
 
@@ -234,6 +236,19 @@ def init_db():
             "PRAGMA table_info(dispatch_jobs)"
         ).fetchall()
     }
+
+    customer_columns = {
+        row[1]
+        for row in cur.execute(
+            "PRAGMA table_info(customers)"
+        ).fetchall()
+    }
+
+    if "quote" not in customer_columns:
+        cur.execute(
+            "ALTER TABLE customers ADD COLUMN quote REAL"
+        )
+
 
     if "treatment_name" not in dispatch_columns:
         cur.execute(
@@ -545,6 +560,8 @@ def add_customer(
     irrigation=None,
 
     payment_method=None,
+    
+    quote=None,
 
     active=1,
 
@@ -630,6 +647,8 @@ def add_customer(
             irrigation,
 
             payment_method,
+            
+            quote,
 
             active,
 
@@ -655,7 +674,7 @@ def add_customer(
 
             ?,?,?,?,?,?,?,?,?,?,
             ?,?,?,?,?,?,?,?,?,?,
-            ?,?,?,?
+            ?,?,?,?,?
 
         )
         """,
@@ -691,6 +710,8 @@ def add_customer(
             irrigation,
 
             payment_method,
+            
+            quote,
 
             active,
 

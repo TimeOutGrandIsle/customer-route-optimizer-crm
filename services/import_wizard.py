@@ -313,6 +313,7 @@ def normalize_column(name):
         .replace(" ", "_")
         .replace("-", "_")
         .replace("/", "_")
+        .replace("?", "")
     )
 
 
@@ -507,11 +508,11 @@ def import_customers(session):
             )
 
             phone = _safe(
-                row.get("phone")
+                row.get("phone_number")
             )
 
             email = _safe(
-                row.get("email")
+                row.get("email_address")
             )
 
             text_phone = _safe(
@@ -539,8 +540,13 @@ def import_customers(session):
             )
 
             special_instructions = _safe(
-                row.get("description")
+                row.get("notes")
             )
+
+            quote = row.get("quote")
+
+            if pd.isna(quote):
+                quote = None
 
             service = _safe(
                 row.get("service")
@@ -627,6 +633,8 @@ def import_customers(session):
                 payment_method=payment_method,
 
                 special_instructions=special_instructions,
+                
+                quote=quote,
 
                 lat=lat,
 
