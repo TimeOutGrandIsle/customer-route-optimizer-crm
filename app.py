@@ -13,6 +13,8 @@ import streamlit as st
 
 from core.crm import initialize_system
 
+from datetime import date
+
 from tabs.import_data import render as render_import_data
 
 from ui.dispatch import (
@@ -34,8 +36,24 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+st.markdown(
+    """
+    <style>
+    div[data-testid="stButton"] button,
+    div[data-testid="stButton"] button p {
+        white-space: nowrap;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-if not st.user.is_logged_in:
+if not bool(
+    st.user.get(
+        "is_logged_in",
+        False,
+    )
+):
 
     st.title("Time Out Lawncare CRM")
 
@@ -52,19 +70,34 @@ if not st.user.is_logged_in:
     st.stop()
 
 
-allowed_users = {
-    email.strip().casefold()
-    for email in st.secrets.get(
-        "ALLOWED_USERS",
-        []
-    )
+configured_roles = st.secrets.get(
+    "USER_ROLES",
+    {},
+)
+
+user_roles = {
+    str(email).strip().casefold():
+    str(role).strip().casefold()
+    for email, role
+    in configured_roles.items()
 }
 
 current_email = str(
     st.user.get("email", "")
 ).strip().casefold()
 
-if current_email not in allowed_users:
+current_role = user_roles.get(
+    current_email,
+    "",
+)
+
+valid_roles = {
+    "admin",
+    "office",
+    "field",
+}
+
+if current_role not in valid_roles:
 
     st.error(
         "This Google account is not authorized."
@@ -81,6 +114,10 @@ with st.sidebar:
     st.write(
         f"Signed in as {current_email}"
     )
+    
+    st.caption(
+        f"Role: {current_role.title()}"
+    )
 
     if st.button(
         "Sign out",
@@ -91,6 +128,37 @@ with st.sidebar:
 # ---------------------------------------------------------
 # DATABASE
 # ---------------------------------------------------------
+
+if current_role == "field":
+
+    app_mode = "Field Mode"
+
+    st.sidebar.info(
+        "Field access"
+    )
+
+else:
+
+    app_mode = st.sidebar.radio(
+        "Workspace",
+        options=[
+            "Office Mode",
+            "Field Mode",
+        ],
+        key="app_workspace_mode",
+    )
+
+if app_mode == "Field Mode":
+
+    initialize_system()
+
+    from ui.field_view import (
+        render as render_field_view,
+    )
+
+    render_field_view()
+
+    st.stop()
 
 initialize_system()
 
@@ -200,6 +268,7 @@ tab_customers, \
 tab_dispatch, \
 tab_schedule, \
 tab_treatments, \
+tab_applications, \
 tab_routes, \
 tab_reports, \
 tab_import, \
@@ -210,6 +279,7 @@ tab_settings = st.tabs(
         "Dispatch",
         "Scheduling",
         "Treatments",
+        "Applications",
         "Routing",
         "Reports",
         "Import Data",
@@ -567,6 +637,248 @@ with tab_dispatch:
         st.info("Driver Mode coming soon.")
 
     st.divider()
+
+    @st.dialog(
+        "Complete Dispatch Stop",
+        width="large",
+    )
+    def complete_dispatch_stop(
+        dispatch_job_id: int,
+    ):
+
+        from datetime import date
+
+        from core.treatment_manager import (
+            complete_treatment_event,
+            get_active_applicators,
+            get_dispatch_treatment_events,
+            get_treatment_products,
+        )
+
+        from ui.dispatch import (
+            mark_job_complete,
+        )
+
+        treatment_events = (
+            get_dispatch_treatment_events(
+                dispatch_job_id
+            )
+        )
+
+        if treatment_events.empty:
+
+            st.info(
+                "This is not linked to a treatment record."
+            )
+
+            if st.button(
+                "Complete Stop",
+                type="primary",
+                use_container_width=True,
+            ):
+
+                mark_job_complete(
+                    dispatch_job_id
+                )
+
+                st.rerun()
+
+            return
+
+        application_date = st.date_input(
+            "Application Date",
+            value=date.today(),
+            key=(
+                "dispatch_application_date_"
+                f"{dispatch_job_id}"
+            ),
+        )
+
+        applicators = get_active_applicators()
+
+        if applicators.empty:
+
+            st.error(
+                "No active applicators are available."
+            )
+
+            return
+
+        applicator_labels = {
+            int(row["id"]): (
+                f"{row['name']} — "
+                f"ID {row['id_number'] or 'Not entered'}"
+            )
+            for _, row in applicators.iterrows()
+        }
+
+        selected_applicator_id = st.selectbox(
+            "Applicator",
+            options=list(applicator_labels),
+            format_func=lambda value: (
+                applicator_labels[value]
+            ),
+            key=(
+                "office_applicator_"
+                f"{dispatch_job_id}"
+            ),
+        )
+
+        completion_notes = st.text_area(
+            "Application Notes",
+            key=(
+                "dispatch_completion_notes_"
+                f"{dispatch_job_id}"
+            ),
+        )
+
+        completion_records = []
+
+        for _, event in treatment_events.iterrows():
+
+            event_id = int(event["id"])
+            treatment_id = int(
+                event["treatment_id"]
+            )
+
+            st.subheader(
+                str(event["treatment"])
+            )
+
+            square_feet = float(
+                event["square_feet"] or 0
+            )
+
+            acres = square_feet / 43560.0
+
+            st.caption(
+                f"{square_feet:,.0f} sq ft "
+                f"({acres:.4f} acres)"
+            )
+
+            chemicals = get_treatment_products(
+                treatment_id
+            )
+
+            chemical_rows = []
+
+            for _, chemical in chemicals.iterrows():
+
+                rate = float(
+                    chemical["rate_per_acre"]
+                    or 0
+                )
+
+                calculated = rate * acres
+
+                chemical_rows.append(
+                    {
+                        "product_id": int(
+                            chemical["product_id"]
+                        ),
+                        "Chemical": chemical[
+                            "product_name"
+                        ],
+                        "EPA Number": chemical[
+                            "epa_number"
+                        ],
+                        "Rate Per Acre": rate,
+                        "Unit": chemical[
+                            "rate_unit"
+                        ],
+                        "Calculated": round(
+                            calculated,
+                            4,
+                        ),
+                        "Actual Total": round(
+                            calculated,
+                            4,
+                        ),
+                    }
+                )
+
+            if chemical_rows:
+
+                edited_chemicals = st.data_editor(
+                    pd.DataFrame(
+                        chemical_rows
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=[
+                        "product_id",
+                        "Chemical",
+                        "EPA Number",
+                        "Rate Per Acre",
+                        "Unit",
+                        "Calculated",
+                    ],
+                    column_config={
+                        "product_id": None,
+                        "Actual Total": (
+                            st.column_config.NumberColumn(
+                                "Actual Total",
+                                min_value=0.0,
+                                format="%.4f",
+                            )
+                        ),
+                    },
+                    key=(
+                        "dispatch_actual_"
+                        f"{event_id}"
+                    ),
+                )
+
+                actual_amounts = {
+                    int(row["product_id"]): float(
+                        row["Actual Total"]
+                    )
+                    for _, row
+                    in edited_chemicals.iterrows()
+                }
+
+            else:
+
+                actual_amounts = {}
+
+                st.warning(
+                    "No chemicals are assigned "
+                    "to this treatment."
+                )
+
+            completion_records.append(
+                {
+                    "event_id": event_id,
+                    "actual_amounts": actual_amounts,
+                }
+            )
+
+        if st.button(
+            "Complete Stop and Save Applications",
+            type="primary",
+            use_container_width=True,
+        ):
+
+            for record in completion_records:
+
+                complete_treatment_event(
+                    event_id=record["event_id"],
+                    notes=completion_notes,
+                    application_date=application_date,
+                    actual_amounts=record[
+                        "actual_amounts"
+                    ],
+                    applicator_employee_id=(
+                        selected_applicator_id
+                    ),
+                )
+
+            st.success(
+                "Stop completed and application "
+                "records saved."
+            )
+
+            st.rerun()
     
 # ==========================================================
 # TODAY'S STOPS
@@ -574,148 +886,164 @@ with tab_dispatch:
 
     st.subheader("Today's Stops")
 
-    if customers.empty:
+    scheduled_stops = dispatch.get(
+        "jobs",
+        [],
+    )
 
-        st.info("No customers available.")
+    if not scheduled_stops:
+
+        st.info(
+            "There are no queued stops."
+        )
 
     else:
 
-        display_columns = []
+        for index, row in enumerate(
+            scheduled_stops
+        ):
 
-        for column in [
+            with st.container(border=True):
 
-            "customer_number",
-
-            "name",
-
-            "service",
-
-            "address",
-
-            "phone",
-
-            "text_phone",
-
-        ]:
-
-            if column in customers.columns:
-
-                display_columns.append(column)
-
-        display = customers[display_columns].copy()
-
-        display.reset_index(
-
-            drop=True,
-
-            inplace=True,
-
-        )
-
-        for index, row in display.iterrows():
-
-            st.container(border=True)
-
-            c1, c2, c3, c4, c5 = st.columns([6,1,1,1,1])
-
-            with c1:
-
-                st.markdown(
-
-                    f"**{index+1}. {row.get('name','')}**"
-
+                c1, c2, c3, c4, c5, c6 = st.columns(
+                    [5, 1, 1, 1, 1.2, 1.6]
                 )
 
-                if "service" in row:
+                with c1:
+
+                    st.markdown(
+                        f"**{index + 1}. "
+                        f"{row.get('name', '')}**"
+                    )
+
+                    treatment_name = (
+                        row.get("treatment_name")
+                        or row.get("service")
+                        or ""
+                    )
 
                     st.caption(
-
-                        f"Service: {row.get('service','')}"
-
+                        f"Treatment: {treatment_name}"
                     )
-
-                if "address" in row:
 
                     st.write(
-
-                        row.get("address","")
-
+                        row.get("address", "")
                     )
 
-            with c2:
+                    if row.get("scheduled_date"):
 
-                address = row.get("address", "")
+                        st.caption(
+                            "Scheduled: "
+                            f"{row['scheduled_date']}"
+                        )
 
-                if address:
+                with c2:
 
-                    maps_url = (
-                        "https://www.google.com/maps/search/?api=1&query="
-                        + address.replace(" ", "+")
+                    address = str(
+                        row.get("address", "")
+                    ).strip()
+
+                    if address:
+
+                        maps_url = (
+                            "https://www.google.com/maps/"
+                            "search/?api=1&query="
+                            + address.replace(" ", "+")
+                        )
+
+                        st.link_button(
+                            "📍",
+                            maps_url,
+                            use_container_width=True,
+                        )
+
+                with c3:
+
+                    phone = str(
+                        row.get("phone", "")
+                    ).strip()
+
+                    if phone:
+
+                        st.link_button(
+                            "📞",
+                            f"tel:{phone}",
+                            use_container_width=True,
+                        )
+
+                with c4:
+
+                    text_number = str(
+                        row.get(
+                            "text_phone",
+                            row.get("phone", ""),
+                        )
+                    ).strip()
+
+                    if text_number:
+
+                        st.link_button(
+                            "💬",
+                            f"sms:{text_number}",
+                            use_container_width=True,
+                        )
+
+                with c5:
+
+                    job_status = str(
+                        row.get("status", "")
                     )
 
-                    st.link_button(
-                        "📍",
-                        maps_url,
-                        use_container_width=True,
-                    )
+                    if job_status == "queued":
 
-            with c3:
+                        if st.button(
+                            "Arrived",
+                            key=f"arrived_{row['id']}",
+                            use_container_width=True,
+                        ):
 
-                phone = str(row.get("phone", "")).strip()
+                            from ui.dispatch import (
+                                mark_job_in_progress,
+                            )
 
-                if phone:
+                            mark_job_in_progress(
+                                int(row["id"])
+                            )
 
-                    st.link_button(
-                        "📞",
-                        f"tel:{phone}",
-                        use_container_width=True,
-                    )       
+                            st.rerun()
 
-            with c4:
+                    elif job_status == "in_progress":
 
-                text_number = str(
+                        st.success("Arrived")
 
-                    row.get(
+                    elif job_status == "completed":
 
-                        "text_phone",
+                        st.success("Completed")
 
-                        row.get("phone", ""),
+                with c6:
 
-                    )
+                    if row.get("status") in {
+                        "queued",
+                        "in_progress",
+                    }:
 
-                ).strip()
+                        if st.button(
+                            "Completed",
+                            key=(
+                                "complete_stop_"
+                                f"{row['id']}"
+                            ),
+                            use_container_width=True,
+                        ):
 
-                if text_number:
+                            complete_dispatch_stop(
+                                int(row["id"])
+                            )
 
-                    st.link_button(
-
-                        "💬",
-
-                        f"sms:{text_number}",
-
-                        use_container_width=True,
-
-                    )
-                    
-            with c5:
-
-                if st.button(
-
-                    "✅",
-
-                    key=f"complete_{index}",
-
-                    help="Complete Job",
-
-                    use_container_width=True,
-
-                ):
-
-                    st.success(
-
-                        f"{row.get('name')} marked complete."
-
-                    )
+        st.caption(
+            "Complete treatment visits from the Treatments "
+            "tab so actual chemical amounts are recorded."
+        )
 
         st.divider()
 
@@ -790,6 +1118,188 @@ with tab_dispatch:
         )
 
     st.divider()
+
+    st.subheader("Daily Load Sheet")
+
+    load_col1, load_col2, load_col3 = st.columns(3)
+
+    load_gallons_per_acre = load_col1.number_input(
+        "Water Gallons Per Acre",
+        min_value=0.1,
+        value=20.0,
+        step=1.0,
+        key="dispatch_water_gpa",
+    )
+
+    large_tank_size = load_col2.number_input(
+        "Large Tank Gallons",
+        min_value=1.0,
+        value=200.0,
+        step=5.0,
+        key="dispatch_large_tank",
+    )
+
+    small_tank_size = load_col3.number_input(
+        "Small Tank Gallons",
+        min_value=1.0,
+        value=30.0,
+        step=1.0,
+        key="dispatch_small_tank",
+    )
+
+    from core.load_sheet import (
+        build_daily_load_sheet,
+        build_daily_load_sheet_html,
+    )
+
+    load_sheet = build_daily_load_sheet(
+        scheduled_date=date.today(),
+        gallons_per_acre=load_gallons_per_acre,
+        tank_sizes=[
+            large_tank_size,
+            small_tank_size,
+        ],
+    )
+
+    load_summary = load_sheet["summary"]
+
+    load_metric1, load_metric2, load_metric3 = st.columns(3)
+
+    load_metric1.metric(
+        "Scheduled Stops",
+        load_summary["stops"],
+    )
+
+    load_metric2.metric(
+        "Total Acres",
+        load_summary["acres"],
+    )
+
+    load_metric3.metric(
+        "Total Water",
+        f"{load_summary['water_gallons']} gal",
+    )
+
+    with st.expander(
+        "Treatment Mix Totals",
+        expanded=True,
+    ):
+
+        if load_sheet["mix_summary"].empty:
+
+            st.info(
+                "No treatment loads are scheduled today."
+            )
+
+        else:
+
+            st.dataframe(
+                load_sheet["mix_summary"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with st.expander(
+        "Total Chemicals Needed",
+        expanded=True,
+    ):
+
+        if load_sheet["chemical_totals"].empty:
+
+            st.info(
+                "No chemicals are assigned to today's treatments."
+            )
+
+        else:
+
+            st.dataframe(
+                load_sheet["chemical_totals"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with st.expander(
+        "Tank Load Breakdown",
+        expanded=True,
+    ):
+
+        if not load_sheet["tank_plan"].empty:
+
+            st.dataframe(
+                load_sheet["tank_plan"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    load_sheet_html = build_daily_load_sheet_html(
+        load_sheet=load_sheet,
+        scheduled_date=date.today(),
+        gallons_per_acre=(
+            load_gallons_per_acre
+        ),
+        tank_sizes=[
+            large_tank_size,
+            small_tank_size,
+        ],
+    )
+
+    export_col1, export_col2 = st.columns(2)
+
+    export_col1.download_button(
+        "Download Printable Load Sheet",
+        data=load_sheet_html,
+        file_name=(
+            f"daily_load_sheet_"
+            f"{date.today().isoformat()}.html"
+        ),
+        mime="text/html",
+        use_container_width=True,
+    )
+
+    export_col2.download_button(
+        "Download Chemical Totals CSV",
+        data=load_sheet[
+            "chemical_totals"
+        ].to_csv(index=False),
+        file_name=(
+            f"chemical_totals_"
+            f"{date.today().isoformat()}.csv"
+        ),
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    export_col3, export_col4 = st.columns(2)
+
+    export_col3.download_button(
+        "Download Tank Plan CSV",
+        data=load_sheet[
+            "tank_plan"
+        ].to_csv(index=False),
+        file_name=(
+            f"tank_plan_"
+            f"{date.today().isoformat()}.csv"
+        ),
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    export_col4.download_button(
+        "Download Mix Summary CSV",
+        data=load_sheet[
+            "mix_summary"
+        ].to_csv(index=False),
+        file_name=(
+            f"mix_summary_"
+            f"{date.today().isoformat()}.csv"
+        ),
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
+    st.divider()
+
 
     st.subheader("Optimized Route")
 
@@ -998,6 +1508,18 @@ with tab_treatments:
 
     render_treatments()
 
+# ==========================================================
+# APPLICATIONS TAB
+# ==========================================================
+with tab_applications:
+
+    from tabs.applications import (
+        render as render_applications,
+    )
+
+    render_applications(
+        current_email=current_email
+    )
 
 # ==========================================================
 # SCHEDULING TAB
@@ -1026,11 +1548,11 @@ with tab_schedule:
     )
 
     from core.scheduling import (
-        build_schedule_candidates,
-        queue_customers_for_date,
+        build_treatment_schedule_candidates,
+        queue_treatment_events_for_date,
     )
 
-    candidates = build_schedule_candidates(
+    candidates = build_treatment_schedule_candidates(
         schedule_date
     )
 
@@ -1104,29 +1626,21 @@ with tab_schedule:
             default_selection,
         )
 
-        schedule_rows["last_service"] = (
-            pd.to_datetime(
-                schedule_rows["last_service"],
-                errors="coerce",
-            ).dt.date
-        )
-
-        schedule_rows["next_due"] = (
-            pd.to_datetime(
-                schedule_rows["next_due"],
-                errors="coerce",
-            ).dt.date
-        )
+        schedule_rows["due_date"] = pd.to_datetime(
+            schedule_rows["due_date"],
+            errors="coerce",
+        ).dt.date
 
         display_columns = [
             "Schedule",
-            "id",
+            "event_id",
             "name",
-            "address",
-            "service",
-            "last_service",
-            "next_due",
+            "treatment",
+            "event_type",
+            "due_date",
             "days_overdue",
+            "address",
+            "override_reason",
             "already_queued",
         ]
 
@@ -1135,13 +1649,14 @@ with tab_schedule:
             use_container_width=True,
             hide_index=True,
             disabled=[
-                "id",
+                "event_id",
                 "name",
-                "address",
-                "service",
-                "last_service",
-                "next_due",
+                "treatment",
+                "event_type",
+                "due_date",
                 "days_overdue",
+                "address",
+                "override_reason",
                 "already_queued",
             ],
             column_config={
@@ -1150,18 +1665,13 @@ with tab_schedule:
                         "Schedule"
                     )
                 ),
-                "id": None,
+                "event_id": None,
                 "name": "Customer",
-                "address": "Address",
-                "service": "Service",
-                "last_service": (
+                "treatment": "Treatment",
+                "event_type": "Type",
+                "due_date": (
                     st.column_config.DateColumn(
-                        "Last Service"
-                    )
-                ),
-                "next_due": (
-                    st.column_config.DateColumn(
-                        "Next Due"
+                        "Due Date"
                     )
                 ),
                 "days_overdue": (
@@ -1169,6 +1679,8 @@ with tab_schedule:
                         "Days Overdue"
                     )
                 ),
+                "address": "Address",
+                "override_reason": "Weather/Override",
                 "already_queued": (
                     st.column_config.CheckboxColumn(
                         "Queued"
@@ -1176,51 +1688,54 @@ with tab_schedule:
                 ),
             },
             key=(
-                "schedule_due_customers_"
+                "schedule_treatments_"
                 f"{st.session_state.schedule_editor_version}"
             ),
         )
 
-        selected_ids = edited_schedule.loc[
+        selected_event_ids = edited_schedule.loc[
             edited_schedule["Schedule"]
             & ~edited_schedule["already_queued"],
-            "id",
+            "event_id",
         ].tolist()
 
         if st.button(
             (
-                f"Add {len(selected_ids)} "
-                "Selected to Dispatch"
+                f"Add {len(selected_event_ids)} "
+                "Treatment(s) to Dispatch"
             ),
             type="primary",
             use_container_width=True,
-            disabled=not selected_ids,
+            disabled=not selected_event_ids,
             key="schedule_add_dispatch",
         ):
 
-            result = queue_customers_for_date(
-                selected_ids,
+            result = queue_treatment_events_for_date(
+                selected_event_ids,
                 schedule_date,
             )
 
             st.success(
-                f"Added {result['created']} "
-                "customer(s) to dispatch."
+                f"Created {result['jobs_created']} dispatch "
+                f"stop(s) and linked "
+                f"{result['events_linked']} treatment(s)."
             )
 
             if result["skipped"]:
 
                 st.info(
-                    f"Skipped {result['skipped']} "
-                    "customer(s) already in dispatch."
+                    f"Skipped {result['skipped']} treatment(s) "
+                    "already in dispatch."
                 )
 
             st.rerun()
 
     else:
 
-        st.success(
-            "No active customers are due by this date."
+        st.info(
+            "No planned treatments are due by this date. "
+            "Generate the seasonal schedule from the "
+            "Treatments tab first."
         )
 
     st.divider()
@@ -1242,7 +1757,8 @@ with tab_schedule:
             )
 
             routes = build_multi_driver_routes(
-                crews=int(crew_count)
+                crews=int(crew_count),
+                scheduled_date=schedule_date,
             )
 
             if routes:
@@ -1411,7 +1927,10 @@ with tab_reports:
 
     st.header("Reports")
 
-    route_report_tab, inspector_report_tab = st.tabs(
+    (
+        route_report_tab,
+        inspector_report_tab,
+    ) = st.tabs(
         [
             "Daily Route",
             "Licensing Inspector",
@@ -1534,12 +2053,8 @@ with tab_reports:
             else:
 
                 application_count = inspector_report[
-                    [
-                        "Application Date",
-                        "Customer",
-                        "Treatment",
-                    ]
-                ].drop_duplicates().shape[0]
+                    "Application ID"
+                ].nunique()
 
                 metric_col1, metric_col2 = st.columns(2)
 
@@ -1563,6 +2078,18 @@ with tab_reports:
                 inspector_report,
                 report_start,
                 report_end,
+            )
+
+            st.subheader(
+                "Printable Report Preview"
+            )
+
+            import streamlit.components.v1 as components
+
+            components.html(
+                inspector_html,
+                height=750,
+                scrolling=True,
             )
 
             csv_data = inspector_report.to_csv(

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -25,6 +25,7 @@ from core.crm import (
 )
 
 from data.database import (
+    execute,
     get_dispatch_jobs,
     update_dispatch_status,
 )
@@ -107,17 +108,45 @@ def dispatch_summary():
 # DATABASE HELPERS
 # ==========================================================
 
-def get_dispatch_queue() -> List[Dict[str, Any]]:
+def get_dispatch_queue(
+    scheduled_date=None,
+) -> List[Dict[str, Any]]:
     """
-    Returns queued jobs as dictionaries.
+    Return active stops for one scheduled date.
     """
+    selected_date = (
+        pd.to_datetime(
+            scheduled_date or date.today()
+        )
+        .date()
+        .isoformat()
+    )
 
-    df = list_dispatch_jobs(status="queued")
+    df = list_dispatch_jobs()
 
     if df.empty:
         return []
 
-    return df.to_dict("records")
+    active = df[
+        df["status"].isin(
+            ["queued", "in_progress"]
+        )
+    ].copy()
+
+    active["scheduled_date"] = pd.to_datetime(
+        active["scheduled_date"],
+        errors="coerce",
+    ).dt.date.astype(str)
+
+    active = active[
+        active["scheduled_date"]
+        == selected_date
+    ]
+
+    if active.empty:
+        return []
+
+    return active.to_dict("records")
 
 
 def get_all_dispatch_jobs() -> List[Dict[str, Any]]:
@@ -164,15 +193,15 @@ def build_queue_from_customers(customers: List[Dict[str, Any]]) -> List[Dict[str
 
 def clear_queue() -> None:
     """
-    Marks all queued jobs as cancelled in DB.
+    Cancel today's active queue and release treatments.
     """
-    jobs = get_dispatch_jobs(status="queued")
+    jobs = get_dispatch_queue()
 
-    if jobs is None or jobs.empty:
-        return
+    for job in jobs:
 
-    for _, row in jobs.iterrows():
-        update_dispatch_status(row["id"], "cancelled")
+        mark_job_cancelled(
+            int(job["id"])
+        )
 
 
 # ==========================================================
@@ -261,12 +290,15 @@ def build_dispatch_dataframe() -> pd.DataFrame:
 
 def build_multi_driver_routes(
     crews: int = 2,
+    scheduled_date=None,
 ):
     """
     Splits queued work between multiple crews.
     """
 
-    jobs = get_dispatch_queue()
+    jobs = get_dispatch_queue(
+        scheduled_date=scheduled_date
+    )
 
     if not jobs:
         return []
@@ -309,10 +341,27 @@ def mark_job_in_progress(
         "in_progress",
     )
 
+def release_linked_treatments(
+    job_id: int,
+):
+    execute(
+        """
+        UPDATE treatment_events
+        SET dispatch_job_id=NULL
+        WHERE dispatch_job_id=?
+          AND status='planned'
+        """,
+        (int(job_id),),
+    )
+
 
 def mark_job_cancelled(
     job_id: int,
 ):
+    release_linked_treatments(
+        job_id
+    )
+
     update_dispatch_status(
         job_id,
         "cancelled",
@@ -321,16 +370,15 @@ def mark_job_cancelled(
 
 def cancel_entire_queue():
     """
-    Cancels every queued dispatch job.
+    Cancel today's active queue and return planned
+    treatments to Scheduling.
     """
-
     jobs = get_dispatch_queue()
 
     for job in jobs:
 
-        update_dispatch_status(
-            job["id"],
-            "cancelled",
+        mark_job_cancelled(
+            int(job["id"])
         )
 
 

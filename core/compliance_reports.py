@@ -42,7 +42,7 @@ PRINT_STYLE = """
         width: 100%;
         border-collapse: collapse;
         margin-top: 18px;
-        font-size: 12px;
+        font-size: 9px;
     }
 
     th, td {
@@ -70,6 +70,12 @@ PRINT_STYLE = """
             margin: 8px;
         }
     }
+    
+    @page {
+        size: landscape;
+        margin: 0.35in;
+    }
+    
 </style>
 """
 
@@ -78,6 +84,9 @@ def get_application_report(
     start_date: date | str,
     end_date: date | str,
 ) -> pd.DataFrame:
+    """
+    Combine new CRM applications and imported workbook history.
+    """
     start = pd.to_datetime(
         start_date
     ).date().isoformat()
@@ -86,10 +95,15 @@ def get_application_report(
         end_date
     ).date().isoformat()
 
-    return dataframe(
+    current = dataframe(
         """
         SELECT
+            'CRM-' || ar.id AS "Application ID",
             ar.application_date AS "Application Date",
+            '' AS "Start Time",
+            '' AS "End Time",
+            ar.applicator AS "Applicator",
+            ar.applicator_id_number AS "Applicator ID",
             c.name AS "Customer",
             COALESCE(
                 NULLIF(c.address, ''),
@@ -97,19 +111,19 @@ def get_application_report(
                     COALESCE(c.street_address, '') ||
                     CASE
                         WHEN c.city IS NOT NULL
-                        AND c.city != ''
+                         AND c.city != ''
                         THEN ', ' || c.city
                         ELSE ''
                     END ||
                     CASE
                         WHEN c.state IS NOT NULL
-                        AND c.state != ''
+                         AND c.state != ''
                         THEN ', ' || c.state
                         ELSE ''
                     END ||
                     CASE
                         WHEN c.zip IS NOT NULL
-                        AND c.zip != ''
+                         AND c.zip != ''
                         THEN ' ' || c.zip
                         ELSE ''
                     END
@@ -119,6 +133,10 @@ def get_application_report(
             c.text_phone AS "Text Phone",
             c.email AS "Email",
             td.name AS "Treatment",
+            printf(
+                '%.0f sq ft',
+                ar.property_square_feet
+            ) AS "Area Treated",
             ac.product_name AS "Chemical",
             ac.epa_number AS "EPA Number",
             ac.rate_per_acre AS "Rate",
@@ -128,14 +146,15 @@ def get_application_report(
             ac.amount_unit AS "Amount Unit",
             ar.property_square_feet AS "Property Sq Ft",
             ar.acres AS "Acres",
-            ar.notes AS "Notes"
+            ar.notes AS "Notes",
+            'CRM' AS "Source"
         FROM application_records ar
         INNER JOIN customers c
-            ON c.id = ar.customer_id
+            ON c.id=ar.customer_id
         INNER JOIN treatment_definitions td
-            ON td.id = ar.treatment_id
+            ON td.id=ar.treatment_id
         LEFT JOIN application_chemicals ac
-            ON ac.application_id = ar.id
+            ON ac.application_id=ar.id
         WHERE DATE(ar.application_date)
             BETWEEN DATE(?) AND DATE(?)
         ORDER BY
@@ -148,6 +167,123 @@ def get_application_report(
             end,
         ),
     )
+
+    imported = dataframe(
+        """
+        SELECT
+            'IMPORT-' || ia.id AS "Application ID",
+            ia.application_date AS "Application Date",
+            ia.application_start_time AS "Start Time",
+            ia.application_end_time AS "End Time",
+            ia.applicator AS "Applicator",
+            ia.applicator_id_number AS "Applicator ID",
+            COALESCE(
+                c.name,
+                ia.customer_name
+            ) AS "Customer",
+            COALESCE(
+                NULLIF(c.address, ''),
+                TRIM(
+                    COALESCE(c.street_address, '') ||
+                    CASE
+                        WHEN c.city IS NOT NULL
+                         AND c.city != ''
+                        THEN ', ' || c.city
+                        ELSE ''
+                    END ||
+                    CASE
+                        WHEN c.state IS NOT NULL
+                         AND c.state != ''
+                        THEN ', ' || c.state
+                        ELSE ''
+                    END ||
+                    CASE
+                        WHEN c.zip IS NOT NULL
+                         AND c.zip != ''
+                        THEN ' ' || c.zip
+                        ELSE ''
+                    END
+                ),
+                ''
+            ) AS "Full Address",
+            COALESCE(c.phone, '') AS "Phone",
+            COALESCE(c.text_phone, '') AS "Text Phone",
+            COALESCE(c.email, '') AS "Email",
+            ia.treatment_type AS "Treatment",
+            ia.size_of_area_treated AS "Area Treated",
+            iac.brand_name AS "Chemical",
+            COALESCE(
+                NULLIF(iac.epa_number, ''),
+                p.epa_number,
+                ''
+            ) AS "EPA Number",
+            iac.rate_per_acre AS "Rate",
+            '' AS "Rate Unit",
+            NULL AS "Calculated Amount",
+            iac.total_amount_oz AS "Total Applied",
+            'oz' AS "Amount Unit",
+            NULL AS "Property Sq Ft",
+            NULL AS "Acres",
+            '' AS "Notes",
+            'Workbook Import' AS "Source"
+        FROM imported_applications ia
+        LEFT JOIN customers c
+            ON c.id=ia.customer_id
+        LEFT JOIN imported_application_chemicals iac
+            ON iac.application_id=ia.id
+        LEFT JOIN products p
+            ON p.id=iac.product_id
+        WHERE DATE(ia.application_date)
+            BETWEEN DATE(?) AND DATE(?)
+        ORDER BY
+            ia.application_date,
+            ia.customer_name,
+            iac.chemical_position
+        """,
+        (
+            start,
+            end,
+        ),
+    )
+
+    report = pd.concat(
+        [
+            current,
+            imported,
+        ],
+        ignore_index=True,
+    )
+
+    if report.empty:
+        return report
+
+    report["Application Date"] = pd.to_datetime(
+        report["Application Date"],
+        errors="coerce",
+    )
+
+    report.sort_values(
+        [
+            "Application Date",
+            "Customer",
+            "Chemical",
+        ],
+        inplace=True,
+        na_position="last",
+    )
+
+    report["Application Date"] = (
+        report["Application Date"]
+        .dt.date
+        .astype(str)
+    )
+
+    report.reset_index(
+        drop=True,
+        inplace=True,
+    )
+
+    return report
 
 
 def _document(
@@ -189,12 +325,8 @@ def build_inspector_html(
 
     else:
         application_count = report[
-            [
-                "Application Date",
-                "Customer",
-                "Treatment",
-            ]
-        ].drop_duplicates().shape[0]
+            "Application ID"
+        ].nunique()
 
         body = f"""
 <div class="summary">

@@ -51,7 +51,7 @@ def completed_jobs():
             ON sh.customer_id = c.id
 
         ORDER BY sh.service_date
-        
+        """
     )
     
 # ==========================================================

@@ -184,7 +184,9 @@ def init_db():
         (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-            customer_id INTEGER NOT NULL,
+                        customer_id INTEGER NOT NULL,
+
+            treatment_name TEXT,
 
             scheduled_date TEXT,
 
@@ -225,6 +227,21 @@ def init_db():
         )
     )
     """)
+    
+    dispatch_columns = {
+        row[1]
+        for row in cur.execute(
+            "PRAGMA table_info(dispatch_jobs)"
+        ).fetchall()
+    }
+
+    if "treatment_name" not in dispatch_columns:
+        cur.execute(
+            """
+            ALTER TABLE dispatch_jobs
+            ADD COLUMN treatment_name TEXT
+            """
+        )
 
     # -------------------------------------------------
     # Geocode Cache
@@ -1007,27 +1024,24 @@ def add_dispatch_job(
     customer_id: int,
     scheduled_date: str | None = None,
     notes: str = "",
+    treatment_name: str | None = None,
 ) -> int:
     """
     Queue a customer for dispatch.
     """
-
     return execute(
         """
-        INSERT INTO dispatch_jobs
-        (
+        INSERT INTO dispatch_jobs (
             customer_id,
+            treatment_name,
             scheduled_date,
             notes
         )
-
-        VALUES
-        (
-            ?,?,?
-        )
+        VALUES (?, ?, ?, ?)
         """,
         (
             customer_id,
+            treatment_name,
             scheduled_date,
             notes,
         ),
@@ -1051,7 +1065,12 @@ def get_dispatch_jobs(
             c.lat,
             c.lng,
             c.phone,
-            c.service,
+            c.text_phone,
+            COALESCE(
+                NULLIF(dj.treatment_name, ''),
+                c.service
+            ) AS service,
+            dj.treatment_name,
             c.neighborhood,
             c.cluster_id,
             c.distance_from_cluster,

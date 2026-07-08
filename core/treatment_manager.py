@@ -158,6 +158,7 @@ def initialize_treatment_system():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 customer_id INTEGER NOT NULL,
                 treatment_id INTEGER NOT NULL,
+                dispatch_job_id INTEGER,
                 due_date TEXT NOT NULL,
                 status TEXT DEFAULT 'planned',
                 event_type TEXT DEFAULT 'standard',
@@ -168,6 +169,8 @@ def initialize_treatment_system():
                 FOREIGN KEY(customer_id)
                     REFERENCES customers(id)
                     ON DELETE CASCADE,
+                FOREIGN KEY(dispatch_job_id)
+                    REFERENCES dispatch_jobs(id),                
                 FOREIGN KEY(treatment_id)
                     REFERENCES treatment_definitions(id)
                     ON DELETE CASCADE,
@@ -179,6 +182,9 @@ def initialize_treatment_system():
                 treatment_event_id INTEGER UNIQUE,
                 customer_id INTEGER NOT NULL,
                 treatment_id INTEGER NOT NULL,
+                applicator_employee_id INTEGER,
+                applicator TEXT,
+                applicator_id_number TEXT,
                 application_date TEXT NOT NULL,
                 property_square_feet REAL DEFAULT 0,
                 acres REAL DEFAULT 0,
@@ -189,7 +195,9 @@ def initialize_treatment_system():
                 FOREIGN KEY(customer_id)
                     REFERENCES customers(id),
                 FOREIGN KEY(treatment_id)
-                    REFERENCES treatment_definitions(id)
+                    REFERENCES treatment_definitions(id),
+                FOREIGN KEY(applicator_employee_id)
+                    REFERENCES employees(id)
             );
 
             CREATE TABLE IF NOT EXISTS application_chemicals (
@@ -210,6 +218,49 @@ def initialize_treatment_system():
                     REFERENCES products(id)
             );
 
+            CREATE TABLE IF NOT EXISTS imported_applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_hash TEXT NOT NULL UNIQUE,
+                source_row_number INTEGER,
+                customer_id INTEGER,
+                customer_name TEXT NOT NULL,
+                application_date TEXT,
+                application_start_time TEXT,
+                application_end_time TEXT,
+                applicator TEXT,
+                applicator_id_number TEXT,
+                treatment_type TEXT,
+                size_of_area_treated TEXT,
+                raw_data TEXT NOT NULL,
+                imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(customer_id)
+                    REFERENCES customers(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS imported_application_chemicals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                application_id INTEGER NOT NULL,
+                chemical_position INTEGER NOT NULL,
+                product_id INTEGER,
+                brand_name TEXT,
+                active_ingredients TEXT,
+                rate_per_acre TEXT,
+                total_amount_oz REAL,
+                epa_number TEXT,
+                FOREIGN KEY(application_id)
+                    REFERENCES imported_applications(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(product_id)
+                    REFERENCES products(id),
+                UNIQUE(application_id, chemical_position)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_imported_application_date
+            ON imported_applications(application_date);
+
+            CREATE INDEX IF NOT EXISTS idx_imported_application_customer
+            ON imported_applications(customer_id);
+
             CREATE INDEX IF NOT EXISTS idx_application_date
             ON application_records(application_date);
 
@@ -221,6 +272,60 @@ def initialize_treatment_system():
             ON treatment_events(customer_id);
             """
         )
+
+        event_columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(treatment_events)"
+            ).fetchall()
+        }
+
+        if "dispatch_job_id" not in event_columns:
+            conn.execute(
+                """
+                ALTER TABLE treatment_events
+                ADD COLUMN dispatch_job_id INTEGER
+                """
+            )
+
+        employee_columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(employees)"
+            ).fetchall()
+        }
+
+        if "id_number" not in employee_columns:
+            conn.execute(
+                """
+                ALTER TABLE employees
+                ADD COLUMN id_number TEXT
+                """
+            )
+
+        application_columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(application_records)"
+            ).fetchall()
+        }
+
+        application_fields = {
+            "applicator_employee_id": "INTEGER",
+            "applicator": "TEXT",
+            "applicator_id_number": "TEXT",
+        }
+
+        for column, column_type in application_fields.items():
+
+            if column not in application_columns:
+
+                conn.execute(
+                    f"""
+                    ALTER TABLE application_records
+                    ADD COLUMN {column} {column_type}
+                    """
+                )
 
         conn.commit()
 
@@ -530,6 +635,8 @@ def get_treatment_events(
             c.address,
             c.square_feet,
             te.treatment_id,
+            te.dispatch_job_id,
+            dj.status AS dispatch_status,
             td.name AS treatment,
             td.window_start,
             td.window_end,
@@ -544,6 +651,8 @@ def get_treatment_events(
             ON c.id = te.customer_id
         INNER JOIN treatment_definitions td
             ON td.id = te.treatment_id
+        LEFT JOIN dispatch_jobs dj
+            ON dj.id = te.dispatch_job_id            
     """
 
     if not include_completed:
@@ -612,12 +721,56 @@ def shift_pending_treatments(
 
     return len(pending)
 
+def get_dispatch_treatment_events(
+    dispatch_job_id: int,
+) -> pd.DataFrame:
+    return dataframe(
+        """
+        SELECT
+            te.id,
+            te.customer_id,
+            te.treatment_id,
+            td.name AS treatment,
+            c.name AS customer,
+            c.square_feet
+        FROM treatment_events te
+        INNER JOIN treatment_definitions td
+            ON td.id=te.treatment_id
+        INNER JOIN customers c
+            ON c.id=te.customer_id
+        WHERE te.dispatch_job_id=?
+          AND te.status='planned'
+        ORDER BY td.name
+        """,
+        (int(dispatch_job_id),),
+    )
+
+def get_active_applicators() -> pd.DataFrame:
+    return dataframe(
+        """
+        SELECT
+            id,
+            first_name,
+            last_name,
+            TRIM(
+                COALESCE(first_name, '') || ' ' ||
+                COALESCE(last_name, '')
+            ) AS name,
+            id_number,
+            phone,
+            email
+        FROM employees
+        WHERE active=1
+        ORDER BY first_name, last_name
+        """
+    )
 
 def complete_treatment_event(
     event_id: int,
     notes: str = "",
     application_date: date | str | None = None,
     actual_amounts: Dict[int, float] | None = None,
+    applicator_employee_id: int | None = None,
 ):
     events = dataframe(
         """
@@ -643,6 +796,38 @@ def complete_treatment_event(
         )
 
     event = events.iloc[0]
+    
+    applicator_name = ""
+    applicator_id_number = ""
+
+    if applicator_employee_id is not None:
+
+        applicators = dataframe(
+            """
+            SELECT
+                TRIM(
+                    COALESCE(first_name, '') || ' ' ||
+                    COALESCE(last_name, '')
+                ) AS name,
+                id_number
+            FROM employees
+            WHERE id=?
+            """,
+            (int(applicator_employee_id),),
+        )
+
+        if applicators.empty:
+            raise ValueError(
+                "The selected applicator was not found."
+            )
+
+        applicator_name = str(
+            applicators.iloc[0]["name"] or ""
+        )
+
+        applicator_id_number = str(
+            applicators.iloc[0]["id_number"] or ""
+        )
 
     applied_date = pd.to_datetime(
         application_date or date.today()
@@ -671,17 +856,23 @@ def complete_treatment_event(
                 treatment_event_id,
                 customer_id,
                 treatment_id,
+                applicator_employee_id,
+                applicator,
+                applicator_id_number,
                 application_date,
                 property_square_feet,
                 acres,
                 notes
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(event_id),
                 int(event["customer_id"]),
                 int(event["treatment_id"]),
+                applicator_employee_id,
+                applicator_name,
+                applicator_id_number,
                 applied_date,
                 square_feet,
                 acres,

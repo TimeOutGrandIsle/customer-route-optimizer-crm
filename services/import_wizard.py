@@ -1142,82 +1142,507 @@ def import_master_data(session):
 # APPLICATION IMPORT
 # ==========================================================
 
-from data.database import add_service_record
-
 
 def import_applications(session):
+    """
+    Import the Applications worksheet without discarding fields.
+    Each worksheet row becomes one application with unlimited
+    linked chemical rows.
+    """
+    import hashlib
+    import json
+    import re
+    from datetime import datetime, time
+
+    from core.treatment_manager import (
+        initialize_treatment_system,
+    )
+    from data.database import (
+        get_connection,
+        get_customers,
+        get_products,
+    )
+
+    initialize_treatment_system()
 
     df = normalize_columns(
         application_dataframe(session)
     )
 
     if df.empty:
-
         return {
-
             "imported": 0,
-
+            "duplicates": 0,
             "errors": 0,
-
         }
 
-    imported = 0
+    customers = get_customers()
+    products = get_products()
 
-    errors = 0
+    customer_lookup = {}
 
-    for _, row in df.iterrows():
+    if not customers.empty:
+        customer_lookup = {
+            str(row["name"]).strip().casefold():
+            int(row["id"])
+            for _, row in customers.iterrows()
+        }
+
+    product_lookup = {}
+
+    if not products.empty:
+        product_lookup = {
+            str(row["product_name"]).strip().casefold():
+            {
+                "id": int(row["id"]),
+                "epa_number": str(
+                    row["epa_number"] or ""
+                ),
+            }
+            for _, row in products.iterrows()
+            if row.get("product_name") is not None
+        }
+
+    def clean_value(value):
+        if value is None:
+            return None
 
         try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
 
-            customer = _safe(
-                row.get(
-                    "customer",
-                    row.get(
-                        "name"
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+
+        if isinstance(value, datetime):
+            return value.isoformat()
+
+        if isinstance(value, time):
+            return value.strftime("%H:%M:%S")
+
+        if hasattr(value, "item"):
+            try:
+                return value.item()
+            except Exception:
+                pass
+
+        text = str(value).strip()
+
+        return text if text else None
+
+    def date_value(value):
+        cleaned = clean_value(value)
+
+        if cleaned is None:
+            return None
+
+        try:
+            if isinstance(value, (int, float)):
+                parsed = pd.to_datetime(
+                    value,
+                    unit="D",
+                    origin="1899-12-30",
+                )
+            else:
+                parsed = pd.to_datetime(value)
+
+            return parsed.date().isoformat()
+
+        except Exception:
+            return str(cleaned)
+
+    def time_value(value):
+        cleaned = clean_value(value)
+
+        if cleaned is None:
+            return None
+
+        if isinstance(value, time):
+            return value.strftime("%H:%M:%S")
+
+        if isinstance(value, datetime):
+            return value.strftime("%H:%M:%S")
+
+        if isinstance(value, pd.Timestamp):
+            return value.strftime("%H:%M:%S")
+
+        if isinstance(value, (int, float)):
+            total_seconds = round(
+                float(value) * 86400
+            )
+
+            hours = (
+                total_seconds // 3600
+            ) % 24
+
+            minutes = (
+                total_seconds % 3600
+            ) // 60
+
+            seconds = total_seconds % 60
+
+            return (
+                f"{hours:02d}:"
+                f"{minutes:02d}:"
+                f"{seconds:02d}"
+            )
+
+        return str(cleaned)
+
+    def numeric_value(value):
+        cleaned = clean_value(value)
+
+        if cleaned is None:
+            return None
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        match = re.search(
+            r"-?\d+(?:\.\d+)?",
+            str(cleaned).replace(",", ""),
+        )
+
+        if not match:
+            return None
+
+        return float(match.group())
+
+    imported = 0
+    duplicates = 0
+    errors = 0
+
+    conn = get_connection()
+
+    try:
+        cursor = conn.cursor()
+
+        for dataframe_index, row in df.iterrows():
+            excel_row_number = int(
+                dataframe_index
+            ) + 2
+
+            try:
+                raw_record = {
+                    str(column): clean_value(
+                        row.get(column)
+                    )
+                    for column in df.columns
+                }
+
+                raw_json = json.dumps(
+                    raw_record,
+                    sort_keys=True,
+                    default=str,
+                )
+
+                source_hash = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "sheet": "Applications",
+                            "row": excel_row_number,
+                            "data": raw_record,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    ).encode("utf-8")
+                ).hexdigest()
+
+                cursor.execute(
+                    """
+                    SELECT id
+                    FROM imported_applications
+                    WHERE source_hash=?
+                    """,
+                    (source_hash,),
+                )
+
+                if cursor.fetchone() is not None:
+                    duplicates += 1
+                    continue
+
+                customer_name = clean_value(
+                    row.get("customer_name")
+                )
+
+                if not customer_name:
+                    raise ValueError(
+                        f"Row {excel_row_number}: "
+                        "Customer Name is missing."
+                    )
+
+                customer_id = customer_lookup.get(
+                    str(customer_name)
+                    .strip()
+                    .casefold()
+                )
+
+                if customer_id is None:
+                    session.warnings.append(
+                        f"Application row "
+                        f"{excel_row_number}: customer "
+                        f"not matched: {customer_name}"
+                    )
+
+                applicator = clean_value(
+                    row.get("applicator")
+                )
+
+                applicator_id = clean_value(
+                    row.get("id_number")
+                )
+
+                if applicator:
+                    name_parts = str(
+                        applicator
+                    ).strip().split(
+                        maxsplit=1
+                    )
+
+                    first_name = name_parts[0]
+
+                    last_name = (
+                        name_parts[1]
+                        if len(name_parts) > 1
+                        else ""
+                    )
+
+                    employee = None
+
+                    if applicator_id:
+                        employee = cursor.execute(
+                            """
+                            SELECT id
+                            FROM employees
+                            WHERE id_number=?
+                            LIMIT 1
+                            """,
+                            (str(applicator_id),),
+                        ).fetchone()
+
+                    if employee is None:
+                        employee = cursor.execute(
+                            """
+                            SELECT id
+                            FROM employees
+                            WHERE LOWER(first_name)=LOWER(?)
+                              AND LOWER(last_name)=LOWER(?)
+                            LIMIT 1
+                            """,
+                            (
+                                first_name,
+                                last_name,
+                            ),
+                        ).fetchone()
+
+                    if employee is None:
+                        cursor.execute(
+                            """
+                            INSERT INTO employees (
+                                first_name,
+                                last_name,
+                                id_number,
+                                active
+                            )
+                            VALUES (?, ?, ?, 1)
+                            """,
+                            (
+                                first_name,
+                                last_name,
+                                applicator_id,
+                            ),
+                        )
+
+                    elif applicator_id:
+                        cursor.execute(
+                            """
+                            UPDATE employees
+                            SET id_number=COALESCE(
+                                NULLIF(id_number, ''),
+                                ?
+                            )
+                            WHERE id=?
+                            """,
+                            (
+                                str(applicator_id),
+                                int(employee["id"]),
+                            ),
+                        )
+
+                cursor.execute(
+                    """
+                    INSERT INTO imported_applications (
+                        source_hash,
+                        source_row_number,
+                        customer_id,
+                        customer_name,
+                        application_date,
+                        application_start_time,
+                        application_end_time,
+                        applicator,
+                        applicator_id_number,
+                        treatment_type,
+                        size_of_area_treated,
+                        raw_data
+                    )
+                    VALUES (
+                        ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        source_hash,
+                        excel_row_number,
+                        customer_id,
+                        str(customer_name),
+                        date_value(
+                            row.get(
+                                "application_date"
+                            )
+                        ),
+                        time_value(
+                            row.get(
+                                "application_start_time"
+                            )
+                        ),
+                        time_value(
+                            row.get(
+                                "application_end_time"
+                            )
+                        ),
+                        applicator,
+                        applicator_id,
+                        clean_value(
+                            row.get(
+                                "treatment_type"
+                            )
+                        ),
+                        clean_value(
+                            row.get(
+                                "size_of_area_treated"
+                            )
+                        ),
+                        raw_json,
                     ),
                 )
-            )
 
-            service = _safe(
-                row.get(
-                    "service"
+                application_id = (
+                    cursor.lastrowid
                 )
-            )
 
-            notes = _safe(
-                row.get(
-                    "notes"
+                chemical_positions = sorted(
+                    {
+                        int(match.group(1))
+                        for column in df.columns
+                        for match in [
+                            re.fullmatch(
+                                r"brand_name_(\d+)",
+                                str(column),
+                            )
+                        ]
+                        if match
+                    }
                 )
-            )
 
-            if customer and service:
+                for position in chemical_positions:
+                    brand_name = clean_value(
+                        row.get(
+                            f"brand_name_{position}"
+                        )
+                    )
 
-                add_service_record(
+                    if not brand_name:
+                        continue
 
-                    customer_name=customer,
+                    matched_product = (
+                        product_lookup.get(
+                            str(brand_name)
+                            .strip()
+                            .casefold()
+                        )
+                    )
 
-                    service_type=service,
+                    product_id = (
+                        matched_product["id"]
+                        if matched_product
+                        else None
+                    )
 
-                    notes=notes,
+                    epa_number = (
+                        matched_product[
+                            "epa_number"
+                        ]
+                        if matched_product
+                        else ""
+                    )
 
-                )
+                    cursor.execute(
+                        """
+                        INSERT INTO imported_application_chemicals (
+                            application_id,
+                            chemical_position,
+                            product_id,
+                            brand_name,
+                            active_ingredients,
+                            rate_per_acre,
+                            total_amount_oz,
+                            epa_number
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            application_id,
+                            position,
+                            product_id,
+                            str(brand_name),
+                            clean_value(
+                                row.get(
+                                    "active_ingredients_"
+                                    f"{position}"
+                                )
+                            ),
+                            clean_value(
+                                row.get(
+                                    "rate_per_acre_"
+                                    f"{position}"
+                                )
+                            ),
+                            numeric_value(
+                                row.get(
+                                    "total_amount_"
+                                    "applied_(oz)_"
+                                    f"{position}"
+                                )
+                            ),
+                            epa_number,
+                        ),
+                    )
 
                 imported += 1
 
-        except Exception as ex:
+            except Exception as ex:
+                errors += 1
 
-            session.errors.append(
-                f"Application: {ex}"
-            )
+                session.errors.append(
+                    f"Application row "
+                    f"{excel_row_number}: {ex}"
+                )
 
-            errors += 1
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
     return {
-
         "imported": imported,
-
+        "duplicates": duplicates,
         "errors": errors,
-
     }
 
 

@@ -14,7 +14,17 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 
-from data.database import get_customers, add_dispatch_job, get_dispatch_jobs
+from data.database import (
+    add_dispatch_job,
+    dataframe,
+    get_connection,
+    get_customers,
+    get_dispatch_jobs,
+)
+
+from core.treatment_manager import (
+    get_treatment_events,
+)
 
 
 # =========================
@@ -203,6 +213,288 @@ def queue_customers_for_date(
 
     return {
         "created": created,
+        "skipped": skipped,
+    }
+
+def build_treatment_schedule_candidates(
+    through_date: date | str | None = None,
+) -> List[Dict[str, Any]]:
+    """
+    Return planned treatment visits due by the selected date.
+    """
+    target = pd.to_datetime(
+        through_date or datetime.now().date()
+    ).date()
+
+    events = get_treatment_events()
+
+    if events is None or events.empty:
+        return []
+
+    candidates = []
+
+    for event in events.to_dict("records"):
+
+        event_due = pd.to_datetime(
+            event["due_date"]
+        ).date()
+
+        if event_due > target:
+            continue
+
+        dispatch_status = str(
+            event.get("dispatch_status") or ""
+        )
+
+        already_queued = (
+            event.get("dispatch_job_id") is not None
+            and not pd.isna(
+                event.get("dispatch_job_id")
+            )
+            and dispatch_status
+            in {"queued", "in_progress"}
+        )
+
+        candidates.append(
+            {
+                "event_id": int(event["id"]),
+                "customer_id": int(
+                    event["customer_id"]
+                ),
+                "name": event["customer"],
+                "address": event["address"],
+                "square_feet": event["square_feet"],
+                "treatment": event["treatment"],
+                "event_type": event["event_type"],
+                "due_date": event_due.isoformat(),
+                "days_overdue": max(
+                    0,
+                    (target - event_due).days,
+                ),
+                "override_reason": (
+                    event["override_reason"] or ""
+                ),
+                "already_queued": already_queued,
+            }
+        )
+
+    return sorted(
+        candidates,
+        key=lambda item: (
+            item["already_queued"],
+            -item["days_overdue"],
+            item["name"],
+            item["treatment"],
+        ),
+    )
+
+
+def queue_treatment_events_for_date(
+    event_ids: List[int],
+    scheduled_date: date | str,
+) -> Dict[str, int]:
+    """
+    Group selected treatments by customer and create one
+    dispatch stop per customer.
+    """
+    if not event_ids:
+        return {
+            "jobs_created": 0,
+            "events_linked": 0,
+            "skipped": 0,
+        }
+
+    scheduled = pd.to_datetime(
+        scheduled_date
+    ).date().isoformat()
+
+    unique_ids = list(
+        dict.fromkeys(
+            int(value)
+            for value in event_ids
+        )
+    )
+
+    placeholders = ",".join(
+        "?"
+        for _ in unique_ids
+    )
+
+    events = dataframe(
+        f"""
+        SELECT
+            te.id,
+            te.customer_id,
+            te.dispatch_job_id,
+            dj.status AS dispatch_status,
+            td.name AS treatment
+        FROM treatment_events te
+        INNER JOIN treatment_definitions td
+            ON td.id = te.treatment_id
+        LEFT JOIN dispatch_jobs dj
+            ON dj.id = te.dispatch_job_id
+        WHERE te.id IN ({placeholders})
+          AND te.status='planned'
+        ORDER BY
+            te.customer_id,
+            td.name
+        """,
+        tuple(unique_ids),
+    )
+
+    if events.empty:
+        return {
+            "jobs_created": 0,
+            "events_linked": 0,
+            "skipped": len(unique_ids),
+        }
+
+    jobs_created = 0
+    events_linked = 0
+    skipped = 0
+
+    conn = get_connection()
+
+    try:
+        cursor = conn.cursor()
+
+        for customer_id, customer_events in events.groupby(
+            "customer_id"
+        ):
+
+            ready_events = customer_events[
+                ~customer_events[
+                    "dispatch_status"
+                ].fillna("").isin(
+                    ["queued", "in_progress"]
+                )
+            ]
+
+            skipped += (
+                len(customer_events)
+                - len(ready_events)
+            )
+
+            if ready_events.empty:
+                continue
+
+            cursor.execute(
+                """
+                SELECT id
+                FROM dispatch_jobs
+                WHERE customer_id=?
+                  AND scheduled_date=?
+                  AND status IN (
+                      'queued',
+                      'in_progress'
+                  )
+                ORDER BY id
+                LIMIT 1
+                """,
+                (
+                    int(customer_id),
+                    scheduled,
+                ),
+            )
+
+            existing_job = cursor.fetchone()
+
+            if existing_job is None:
+
+                cursor.execute(
+                    """
+                    INSERT INTO dispatch_jobs (
+                        customer_id,
+                        treatment_name,
+                        scheduled_date,
+                        notes,
+                        status
+                    )
+                    VALUES (?, '', ?, '', 'queued')
+                    """,
+                    (
+                        int(customer_id),
+                        scheduled,
+                    ),
+                )
+
+                dispatch_job_id = (
+                    cursor.lastrowid
+                )
+
+                jobs_created += 1
+
+            else:
+
+                dispatch_job_id = int(
+                    existing_job["id"]
+                )
+
+            for event_id in ready_events["id"]:
+
+                cursor.execute(
+                    """
+                    UPDATE treatment_events
+                    SET dispatch_job_id=?
+                    WHERE id=?
+                    """,
+                    (
+                        dispatch_job_id,
+                        int(event_id),
+                    ),
+                )
+
+                events_linked += 1
+
+            cursor.execute(
+                """
+                SELECT GROUP_CONCAT(
+                    td.name,
+                    ', '
+                )
+                FROM treatment_events te
+                INNER JOIN treatment_definitions td
+                    ON td.id=te.treatment_id
+                WHERE te.dispatch_job_id=?
+                  AND te.status='planned'
+                """,
+                (dispatch_job_id,),
+            )
+
+            treatment_names = (
+                cursor.fetchone()[0] or ""
+            )
+
+            cursor.execute(
+                """
+                UPDATE dispatch_jobs
+                SET
+                    treatment_name=?,
+                    notes=?
+                WHERE id=?
+                """,
+                (
+                    treatment_names,
+                    (
+                        "Treatment visit: "
+                        f"{treatment_names}"
+                    ),
+                    dispatch_job_id,
+                ),
+            )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return {
+        "jobs_created": jobs_created,
+        "events_linked": events_linked,
         "skipped": skipped,
     }
 
