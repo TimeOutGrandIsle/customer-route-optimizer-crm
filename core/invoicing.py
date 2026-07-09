@@ -5,6 +5,9 @@ from html import escape
 
 import pandas as pd
 
+import base64
+from pathlib import Path
+
 from data.database import dataframe, execute, get_connection
 
 
@@ -223,6 +226,8 @@ def create_invoice(
     invoice_date: date,
     due_date: date | None,
     notes: str = "",
+    subtotal_override: float | None = None,
+    tax_override: float | None = None,
 ) -> int:
     ensure_invoice_tables()
 
@@ -266,8 +271,22 @@ def create_invoice(
     if len(customer_ids) > 1:
         raise ValueError("Create invoices for one customer at a time.")
 
-    subtotal = float(ready["default_price"].fillna(0).sum())
-    tax = 0.0
+    default_subtotal = float(
+        ready["default_price"].fillna(0).sum()
+    )
+
+    subtotal = (
+        float(subtotal_override)
+        if subtotal_override is not None
+        else default_subtotal
+    )
+
+    tax = (
+        float(tax_override)
+        if tax_override is not None
+        else 0.0
+    )
+
     total = subtotal + tax
 
     conn = get_connection()
@@ -399,6 +418,18 @@ def add_payment(
     else:
         update_invoice_status(invoice_id, "Partially Paid")
 
+def get_logo_data_uri() -> str:
+    logo_path = Path("assets") / "logo.png"
+
+    if not logo_path.exists():
+        return ""
+
+    encoded = base64.b64encode(
+        logo_path.read_bytes()
+    ).decode("utf-8")
+
+    return f"data:image/png;base64,{encoded}"
+
 
 def build_invoice_html(invoice_id: int) -> str:
     invoices = get_invoices()
@@ -410,6 +441,13 @@ def build_invoice_html(invoice_id: int) -> str:
     row = invoice.iloc[0]
     lines = get_invoice_lines(invoice_id)
     payments = get_payments(invoice_id)
+    logo_data_uri = get_logo_data_uri()
+
+    logo_html = (
+        f'<img src="{logo_data_uri}" class="logo" alt="Time Out Lawncare logo">'
+        if logo_data_uri
+        else ""
+    )
 
     line_rows = ""
 
@@ -449,6 +487,18 @@ def build_invoice_html(invoice_id: int) -> str:
         <meta charset="utf-8">
         <title>{escape(str(row['invoice_number']))}</title>
         <style>
+            .header {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 24px;
+            }}
+
+            .logo {{
+                max-height: 90px;
+                max-width: 220px;
+                object-fit: contain;
+            }}
             body {{
                 font-family: Arial, sans-serif;
                 margin: 32px;
@@ -484,8 +534,19 @@ def build_invoice_html(invoice_id: int) -> str:
     <body>
         <button onclick="window.print()">Print Invoice</button>
 
-        <h1>Time Out Lawncare</h1>
-        <h2>Invoice {escape(str(row['invoice_number']))}</h2>
+        <div class="header">
+            <div>
+                <h1>Time Out Lawncare</h1>
+                <p>
+                    303 East Brandon Court<br>
+                    Brandon, MS 39042<br>
+                    601-941-3586<br>
+                    timeoutlawncare@gmail.com
+                </p>
+                <h2>Invoice {escape(str(row['invoice_number']))}</h2>
+            </div>
+            {logo_html}
+        </div>
 
         <p>
             <strong>Invoice Date:</strong> {escape(str(row['invoice_date']))}<br>
