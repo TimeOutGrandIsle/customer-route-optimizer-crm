@@ -271,6 +271,7 @@ tab_dispatch, \
 tab_schedule, \
 tab_treatments, \
 tab_applications, \
+tab_invoicing, \
 tab_routes, \
 tab_reports, \
 tab_import, \
@@ -282,6 +283,7 @@ tab_settings = st.tabs(
         "Scheduling",
         "Treatments",
         "Applications",
+        "Invoicing",
         "Routing",
         "Reports",
         "Import Data",
@@ -1849,6 +1851,19 @@ with tab_applications:
     render_applications(
         current_email=current_email
     )
+    
+    
+# ==========================================================
+# INVOICING TAB
+# ==========================================================
+
+with tab_invoicing:
+
+    from tabs.invoicing import (
+        render as render_invoicing,
+    )
+
+    render_invoicing()
 
 # ==========================================================
 # SCHEDULING TAB
