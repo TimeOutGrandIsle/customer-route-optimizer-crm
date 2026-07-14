@@ -2478,6 +2478,41 @@ with tab_import:
 
 with tab_settings:
 
+    st.subheader("Database Backup")
+
+    from pathlib import Path
+    from datetime import datetime
+
+    db_path = Path("data") / "timeoutcrm.db"
+
+    if db_path.exists():
+
+        backup_name = (
+            "timeoutcrm_backup_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        )
+
+        st.download_button(
+            "Download Database Backup",
+            data=db_path.read_bytes(),
+            file_name=backup_name,
+            mime="application/octet-stream",
+            use_container_width=True,
+        )
+
+        st.caption(
+            "Download this backup before large imports, "
+            "before deployments, or at the end of each workday."
+        )
+
+    else:
+
+        st.warning(
+            "Database file was not found."
+        )
+
+    st.divider()
+    
     st.header("Settings")
 
     from core.crm import (
