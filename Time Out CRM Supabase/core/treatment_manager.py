@@ -339,7 +339,7 @@ def get_treatment_definitions(
     sql = """
         SELECT
             td.*,
-            STRING_AGG(p.product_name, ', ') AS products
+            GROUP_CONCAT(p.product_name, ', ') AS products
         FROM treatment_definitions td
         LEFT JOIN treatment_products tp
             ON tp.treatment_id = td.id

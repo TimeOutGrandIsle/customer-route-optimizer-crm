@@ -1453,7 +1453,7 @@ def add_service_record(
         """
         UPDATE customers
 
-        SET last_service = CURRENT_DATE::TEXT
+        SET last_service = DATE('now')
 
         WHERE id=?
         """,

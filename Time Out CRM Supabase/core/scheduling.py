@@ -448,7 +448,7 @@ def queue_treatment_events_for_date(
 
             cursor.execute(
                 """
-                SELECT STRING_AGG(
+                SELECT GROUP_CONCAT(
                     td.name,
                     ', '
                 )

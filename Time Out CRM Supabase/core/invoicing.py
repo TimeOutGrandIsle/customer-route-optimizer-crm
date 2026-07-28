@@ -173,19 +173,7 @@ def get_invoices(status: str | None = None) -> pd.DataFrame:
         params.append(status)
 
     sql += """
-        GROUP BY
-            i.id,
-            i.invoice_number,
-            i.invoice_date,
-            i.due_date,
-            i.status,
-            i.customer_id,
-            c.name,
-            c.address,
-            i.subtotal,
-            i.tax,
-            i.total,
-            i.notes
+        GROUP BY i.id
         ORDER BY i.invoice_date DESC, i.id DESC
     """
 
