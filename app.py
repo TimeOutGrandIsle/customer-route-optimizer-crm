@@ -866,6 +866,35 @@ with tab_customers:
 with tab_dispatch:
 
     st.header("Dispatch")
+
+    dispatch_date = st.date_input(
+        "Dispatch Date",
+        value=date.today(),
+        key="dispatch_selected_date",
+        help=(
+            "Select today or a future service date to "
+            "view its queue, route, manifest, and load sheet."
+        ),
+    )
+
+    dispatch = dispatch_dashboard(
+        scheduled_date=dispatch_date
+    )
+
+    dispatch_statistics = dispatch.get(
+        "statistics",
+        {},
+    )
+
+    if dispatch_date == date.today():
+        st.caption(
+            "Showing today's active dispatch queue."
+        )
+    else:
+        st.caption(
+            f"Showing the active dispatch queue for "
+            f"{dispatch_date:%B %d, %Y}."
+        )
     
 # ==========================================================
 # Dispatch Dashboard
@@ -880,52 +909,52 @@ with tab_dispatch:
     if customers is None:
         customers = pd.DataFrame()
 
-    jobs_today = len(customers)
-    completed = 0
-    remaining = jobs_today
+    selected_jobs = dispatch.get(
+        "jobs",
+        [],
+    )
 
-    estimated_revenue = 0.0
+    selected_queued = sum(
+        str(job.get("status", "")).lower()
+        == "queued"
+        for job in selected_jobs
+    )
 
-    if (
-        not customers.empty
-        and "price" in customers.columns
-    ):
-        estimated_revenue = (
-            pd.to_numeric(
-                customers["price"],
-                errors="coerce",
-            )
-            .fillna(0)
-            .sum()
-        )
+    selected_in_progress = sum(
+        str(job.get("status", "")).lower()
+        == "in_progress"
+        for job in selected_jobs
+    )
 
-    st.subheader("Today's Operations")
+    st.subheader(
+        f"Operations — {dispatch_date:%B %d, %Y}"
+    )
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4 = st.columns(4)
 
     c1.metric(
-        "Customers",
+        "All Customers",
         len(customers),
     )
 
     c2.metric(
-        "Jobs Today",
-        jobs_today,
+        "Queued",
+        selected_queued,
     )
 
     c3.metric(
-        "Completed",
-        completed,
+        "In Progress",
+        selected_in_progress,
     )
 
     c4.metric(
-        "Remaining",
-        remaining,
-    )
-
-    c5.metric(
-        "Revenue",
-        f"${estimated_revenue:,.2f}",
+        "Future Active Jobs",
+        int(
+            dispatch_statistics.get(
+                "future_active",
+                0,
+            )
+        ),
     )
 
     st.divider()
@@ -1267,10 +1296,12 @@ with tab_dispatch:
             st.rerun()
     
 # ==========================================================
-# TODAY'S STOPS
+# SELECTED DATE STOPS
 # ==========================================================
 
-    st.subheader("Today's Stops")
+    st.subheader(
+        f"Stops for {dispatch_date:%B %d, %Y}"
+    )
 
     scheduled_stops = dispatch.get(
         "jobs",
@@ -1433,7 +1464,7 @@ with tab_dispatch:
 
         st.divider()
 
-    left, middle, right = st.columns(3)
+    left, middle, right, far_right = st.columns(4)
 
     with left:
 
@@ -1443,7 +1474,9 @@ with tab_dispatch:
             key="dispatch_generate_route",
         ):
 
-            dispatch = dispatch_dashboard()
+            dispatch = dispatch_dashboard(
+                scheduled_date=dispatch_date
+            )
 
             st.success(
                 "Dispatch route generated."
@@ -1462,10 +1495,38 @@ with tab_dispatch:
     with right:
 
         if st.button(
-            "Clear Queued Jobs",
+            "Clear Selected Date",
             use_container_width=True,
             type="secondary",
-            key="dispatch_clear_queue",
+            key="dispatch_clear_selected_queue",
+        ):
+
+            from ui.dispatch import (
+                cancel_queue_for_date,
+            )
+
+            cancel_queue_for_date(
+                scheduled_date=dispatch_date
+            )
+
+            st.success(
+                f"Queue cleared for "
+                f"{dispatch_date:%B %d, %Y}."
+            )
+
+            st.rerun()
+
+    with far_right:
+
+        if st.button(
+            "Clear All Dates",
+            use_container_width=True,
+            type="secondary",
+            key="dispatch_clear_all_queues",
+            help=(
+                "Cancel every queued or in-progress job "
+                "across all service dates."
+            ),
         ):
 
             from ui.dispatch import (
@@ -1475,14 +1536,16 @@ with tab_dispatch:
             cancel_entire_queue()
 
             st.success(
-                "Queued jobs cleared."
+                "All active dispatch queues cleared."
             )
 
             st.rerun()
 
     st.divider()
 
-    st.subheader("Queued Jobs")
+    st.subheader(
+        f"Queued Jobs — {dispatch_date:%B %d, %Y}"
+    )
 
     jobs = dispatch.get(
         "jobs",
@@ -1606,7 +1669,7 @@ with tab_dispatch:
     )
 
     load_sheet = build_daily_load_sheet(
-        scheduled_date=date.today(),
+        scheduled_date=dispatch_date,
         gallons_per_acre=load_gallons_per_acre,
         tank_sizes=[
             large_tank_size,
@@ -1642,7 +1705,8 @@ with tab_dispatch:
         if load_sheet["mix_summary"].empty:
 
             st.info(
-                "No treatment loads are scheduled today."
+                "No treatment loads are scheduled "
+                "for the selected date."
             )
 
         else:
@@ -1661,13 +1725,39 @@ with tab_dispatch:
         if load_sheet["chemical_totals"].empty:
 
             st.info(
-                "No chemicals are assigned to today's treatments."
+                "No chemicals are assigned to treatments "
+                "for the selected date."
             )
 
         else:
 
             st.dataframe(
                 load_sheet["chemical_totals"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with st.expander(
+        "Granular Product Load",
+        expanded=True,
+    ):
+
+        granular_product_load = load_sheet.get(
+            "granular_product_load",
+            pd.DataFrame(),
+        )
+
+        if granular_product_load.empty:
+
+            st.info(
+                "No granular products are scheduled "
+                "for the selected date."
+            )
+
+        else:
+
+            st.dataframe(
+                granular_product_load,
                 use_container_width=True,
                 hide_index=True,
             )
@@ -1687,7 +1777,7 @@ with tab_dispatch:
 
     load_sheet_html = build_daily_load_sheet_html(
         load_sheet=load_sheet,
-        scheduled_date=date.today(),
+        scheduled_date=dispatch_date,
         gallons_per_acre=(
             load_gallons_per_acre
         ),
@@ -1705,7 +1795,7 @@ with tab_dispatch:
         data=load_sheet_html,
         file_name=(
             f"daily_load_sheet_"
-            f"{date.today().isoformat()}.html"
+            f"{dispatch_date.isoformat()}.html"
         ),
         mime="text/html",
         use_container_width=True,
@@ -1718,7 +1808,7 @@ with tab_dispatch:
         ].to_csv(index=False),
         file_name=(
             f"chemical_totals_"
-            f"{date.today().isoformat()}.csv"
+            f"{dispatch_date.isoformat()}.csv"
         ),
         mime="text/csv",
         use_container_width=True,
@@ -1733,7 +1823,7 @@ with tab_dispatch:
         ].to_csv(index=False),
         file_name=(
             f"tank_plan_"
-            f"{date.today().isoformat()}.csv"
+            f"{dispatch_date.isoformat()}.csv"
         ),
         mime="text/csv",
         use_container_width=True,
@@ -1746,7 +1836,21 @@ with tab_dispatch:
         ].to_csv(index=False),
         file_name=(
             f"mix_summary_"
-            f"{date.today().isoformat()}.csv"
+            f"{dispatch_date.isoformat()}.csv"
+        ),
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    st.download_button(
+        "Download Granular Product Load CSV",
+        data=load_sheet.get(
+            "granular_product_load",
+            pd.DataFrame(),
+        ).to_csv(index=False),
+        file_name=(
+            f"granular_product_load_"
+            f"{dispatch_date.isoformat()}.csv"
         ),
         mime="text/csv",
         use_container_width=True,
@@ -1904,7 +2008,8 @@ with tab_dispatch:
     if build_route:
 
         st.success(
-            "Building today's route..."
+            f"Building the route for "
+            f"{dispatch_date:%B %d, %Y}..."
         )
 
     if optimize_clusters:
@@ -1927,13 +2032,16 @@ with tab_dispatch:
 
     st.divider()
 
-    st.subheader("Today's Route Statistics")
+    st.subheader(
+        f"Route Statistics — "
+        f"{dispatch_date:%B %d, %Y}"
+    )
 
     s1, s2, s3, s4 = st.columns(4)
 
     s1.metric(
         "Estimated Stops",
-        jobs_today,
+        len(selected_jobs),
     )
 
     s2.metric(
@@ -2895,9 +3003,10 @@ with tab_settings:
             st.rerun()
 
     st.caption(
-        "Broadcast treatments use lawn acreage and water "
-        "gallons per acre. Spot treatments use one saved "
-        "batch per scheduled customer."
+        "Liquid Broadcast treatments use lawn acreage and "
+        "water gallons per acre. Spot treatments use one "
+        "saved batch per scheduled customer. Granular "
+        "Broadcast treatments use acreage without water."
     )
 
     st.divider()
