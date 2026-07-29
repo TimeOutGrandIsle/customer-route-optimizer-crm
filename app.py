@@ -12,6 +12,9 @@ import pandas as pd
 import streamlit as st
 
 from core.crm import initialize_system
+from core.treatment_manager import (
+    initialize_treatment_system,
+)
 
 from datetime import date
 
@@ -1063,6 +1066,21 @@ with tab_dispatch:
             ),
         )
 
+        from data.database import (
+            get_setting,
+        )
+
+        try:
+            completion_spot_gallons = float(
+                get_setting(
+                    "spot_tank_gallons",
+                    "1.0",
+                )
+                or 1.0
+            )
+        except (TypeError, ValueError):
+            completion_spot_gallons = 1.0
+
         completion_records = []
 
         for _, event in treatment_events.iterrows():
@@ -1082,9 +1100,43 @@ with tab_dispatch:
 
             acres = square_feet / 43560.0
 
+            application_method = str(
+                event.get(
+                    "application_method",
+                    "broadcast",
+                )
+                or "broadcast"
+            ).strip().lower()
+
+            is_spot_completion = (
+                application_method == "spot"
+            )
+
+            completion_rate_label = (
+                "Rate Per Gallon"
+                if is_spot_completion
+                else "Rate Per Acre"
+            )
+
+            rate_basis_quantity = (
+                max(
+                    completion_spot_gallons,
+                    0.1,
+                )
+                if is_spot_completion
+                else acres
+            )
+
             st.caption(
-                f"{square_feet:,.0f} sq ft "
-                f"({acres:.4f} acres)"
+                (
+                    f"Spot-treatment batch: "
+                    f"{rate_basis_quantity:g} gallons"
+                )
+                if is_spot_completion
+                else (
+                    f"{square_feet:,.0f} sq ft "
+                    f"({acres:.4f} acres)"
+                )
             )
 
             chemicals = get_treatment_products(
@@ -1100,7 +1152,10 @@ with tab_dispatch:
                     or 0
                 )
 
-                calculated = rate * acres
+                calculated = (
+                    rate
+                    * rate_basis_quantity
+                )
 
                 chemical_rows.append(
                     {
@@ -1113,7 +1168,7 @@ with tab_dispatch:
                         "EPA Number": chemical[
                             "epa_number"
                         ],
-                        "Rate Per Acre": rate,
+                        completion_rate_label: rate,
                         "Unit": chemical[
                             "rate_unit"
                         ],
@@ -1140,7 +1195,7 @@ with tab_dispatch:
                         "product_id",
                         "Chemical",
                         "EPA Number",
-                        "Rate Per Acre",
+                        completion_rate_label,
                         "Unit",
                         "Calculated",
                     ],
@@ -1452,12 +1507,71 @@ with tab_dispatch:
 
     st.subheader("Daily Load Sheet")
 
-    load_col1, load_col2, load_col3 = st.columns(3)
+    from data.database import (
+        get_setting,
+    )
+
+    if st.session_state.pop(
+        "reload_spray_defaults",
+        False,
+    ):
+        for widget_key in [
+            "dispatch_water_gpa",
+            "dispatch_large_tank",
+            "dispatch_small_tank",
+            "dispatch_spot_tank",
+        ]:
+            st.session_state.pop(
+                widget_key,
+                None,
+            )
+
+    def load_float_setting(
+        setting_key,
+        fallback,
+    ):
+        try:
+            return float(
+                get_setting(
+                    setting_key,
+                    str(fallback),
+                )
+                or fallback
+            )
+        except (TypeError, ValueError):
+            return float(fallback)
+
+    saved_water_gpa = load_float_setting(
+        "water_gallons_per_acre",
+        20.0,
+    )
+
+    saved_large_tank = load_float_setting(
+        "large_tank_gallons",
+        200.0,
+    )
+
+    saved_small_tank = load_float_setting(
+        "small_tank_gallons",
+        30.0,
+    )
+
+    saved_spot_tank = load_float_setting(
+        "spot_tank_gallons",
+        1.0,
+    )
+
+    (
+        load_col1,
+        load_col2,
+        load_col3,
+        load_col4,
+    ) = st.columns(4)
 
     load_gallons_per_acre = load_col1.number_input(
         "Water Gallons Per Acre",
         min_value=0.1,
-        value=20.0,
+        value=saved_water_gpa,
         step=1.0,
         key="dispatch_water_gpa",
     )
@@ -1465,7 +1579,7 @@ with tab_dispatch:
     large_tank_size = load_col2.number_input(
         "Large Tank Gallons",
         min_value=1.0,
-        value=200.0,
+        value=saved_large_tank,
         step=5.0,
         key="dispatch_large_tank",
     )
@@ -1473,9 +1587,17 @@ with tab_dispatch:
     small_tank_size = load_col3.number_input(
         "Small Tank Gallons",
         min_value=1.0,
-        value=30.0,
+        value=saved_small_tank,
         step=1.0,
         key="dispatch_small_tank",
+    )
+
+    spot_tank_size = load_col4.number_input(
+        "Spot Treatment Gallons",
+        min_value=0.1,
+        value=saved_spot_tank,
+        step=0.25,
+        key="dispatch_spot_tank",
     )
 
     from core.load_sheet import (
@@ -1490,6 +1612,7 @@ with tab_dispatch:
             large_tank_size,
             small_tank_size,
         ],
+        spot_tank_size=spot_tank_size,
     )
 
     load_summary = load_sheet["summary"]
@@ -1572,6 +1695,7 @@ with tab_dispatch:
             large_tank_size,
             small_tank_size,
         ],
+        spot_tank_size=spot_tank_size,
     )
 
     export_col1, export_col2 = st.columns(2)
@@ -1878,6 +2002,29 @@ with tab_schedule:
         "then add selected visits to dispatch."
     )
 
+    schedule_dispatch_notice = st.session_state.pop(
+        "schedule_dispatch_notice",
+        None,
+    )
+
+    if schedule_dispatch_notice:
+
+        st.success(
+            f"Created "
+            f"{schedule_dispatch_notice['jobs_created']} "
+            f"dispatch stop(s) and linked "
+            f"{schedule_dispatch_notice['events_linked']} "
+            "treatment(s)."
+        )
+
+        if schedule_dispatch_notice["skipped"]:
+
+            st.info(
+                f"Skipped "
+                f"{schedule_dispatch_notice['skipped']} "
+                "treatment(s) already in dispatch."
+            )
+
     schedule_date = st.date_input(
         "Service Date",
         key="schedule_service_date",
@@ -1933,7 +2080,7 @@ with tab_schedule:
         )
 
         if "schedule_select_all" not in st.session_state:
-            st.session_state.schedule_select_all = True
+            st.session_state.schedule_select_all = False
 
         if "schedule_editor_version" not in st.session_state:
             st.session_state.schedule_editor_version = 0
@@ -2059,18 +2206,12 @@ with tab_schedule:
                 schedule_date,
             )
 
-            st.success(
-                f"Created {result['jobs_created']} dispatch "
-                f"stop(s) and linked "
-                f"{result['events_linked']} treatment(s)."
+            st.session_state.schedule_dispatch_notice = (
+                result
             )
 
-            if result["skipped"]:
-
-                st.info(
-                    f"Skipped {result['skipped']} treatment(s) "
-                    "already in dispatch."
-                )
+            st.session_state.schedule_select_all = False
+            st.session_state.schedule_editor_version += 1
 
             st.rerun()
 
@@ -2113,9 +2254,70 @@ with tab_schedule:
                         f"Crew {crew['crew']}"
                     )
 
-                    st.write(
-                        crew["summary"]
+                    crew_summary = crew.get(
+                        "summary",
+                        {},
                     )
+
+                    preview_1, preview_2, preview_3, preview_4 = (
+                        st.columns(4)
+                    )
+
+                    preview_1.metric(
+                        "Stops",
+                        int(
+                            crew_summary.get(
+                                "stops",
+                                0,
+                            )
+                        ),
+                    )
+
+                    preview_2.metric(
+                        "Distance",
+                        (
+                            f"{float(crew_summary.get(
+                                'distance_miles',
+                                0,
+                            )):.1f} mi"
+                        ),
+                    )
+
+                    preview_3.metric(
+                        "Drive Time",
+                        (
+                            f"{float(crew_summary.get(
+                                'drive_minutes',
+                                0,
+                            )):.0f} min"
+                        ),
+                    )
+
+                    preview_4.metric(
+                        "Total Time",
+                        (
+                            f"{float(crew_summary.get(
+                                'total_minutes',
+                                0,
+                            )):.0f} min"
+                        ),
+                    )
+
+                    google_maps = crew_summary.get(
+                        "google_maps",
+                        "",
+                    )
+
+                    if google_maps:
+
+                        st.link_button(
+                            (
+                                f"Open Crew {crew['crew']} "
+                                "Route in Google Maps"
+                            ),
+                            google_maps,
+                            use_container_width=True,
+                        )
 
                     st.dataframe(
                         pd.DataFrame(
@@ -2579,6 +2781,124 @@ with tab_settings:
             )
 
             st.rerun()
+
+    st.divider()
+
+    st.subheader(
+        "Spray and Tank Defaults"
+    )
+
+    from data.database import (
+        get_setting,
+        set_setting,
+    )
+
+    def settings_float(
+        setting_key,
+        fallback,
+    ):
+        try:
+            return float(
+                get_setting(
+                    setting_key,
+                    str(fallback),
+                )
+                or fallback
+            )
+        except (TypeError, ValueError):
+            return float(fallback)
+
+    with st.form(
+        "spray_defaults_form"
+    ):
+
+        settings_col1, settings_col2 = st.columns(2)
+
+        default_water_gpa = settings_col1.number_input(
+            "Default Water Gallons Per Acre",
+            min_value=0.1,
+            value=settings_float(
+                "water_gallons_per_acre",
+                20.0,
+            ),
+            step=1.0,
+        )
+
+        default_large_tank = settings_col2.number_input(
+            "Large Broadcast Tank Gallons",
+            min_value=1.0,
+            value=settings_float(
+                "large_tank_gallons",
+                200.0,
+            ),
+            step=5.0,
+        )
+
+        settings_col3, settings_col4 = st.columns(2)
+
+        default_small_tank = settings_col3.number_input(
+            "Small Broadcast Tank Gallons",
+            min_value=1.0,
+            value=settings_float(
+                "small_tank_gallons",
+                30.0,
+            ),
+            step=1.0,
+        )
+
+        default_spot_tank = settings_col4.number_input(
+            "Spot Treatment Batch Gallons",
+            min_value=0.1,
+            value=settings_float(
+                "spot_tank_gallons",
+                1.0,
+            ),
+            step=0.25,
+        )
+
+        save_spray_defaults = st.form_submit_button(
+            "Save Spray and Tank Defaults",
+            type="primary",
+            use_container_width=True,
+        )
+
+        if save_spray_defaults:
+
+            set_setting(
+                "water_gallons_per_acre",
+                str(float(default_water_gpa)),
+            )
+
+            set_setting(
+                "large_tank_gallons",
+                str(float(default_large_tank)),
+            )
+
+            set_setting(
+                "small_tank_gallons",
+                str(float(default_small_tank)),
+            )
+
+            set_setting(
+                "spot_tank_gallons",
+                str(float(default_spot_tank)),
+            )
+
+            st.session_state[
+                "reload_spray_defaults"
+            ] = True
+
+            st.success(
+                "Spray and tank defaults saved."
+            )
+
+            st.rerun()
+
+    st.caption(
+        "Broadcast treatments use lawn acreage and water "
+        "gallons per acre. Spot treatments use one saved "
+        "batch per scheduled customer."
+    )
 
     st.divider()
 

@@ -15,6 +15,9 @@ def _amount_unit(rate_unit: str) -> str:
         "/acre",
         " per acre",
         "/ac",
+        "/gallon",
+        " per gallon",
+        "/gal",
     ]:
         if unit.lower().endswith(suffix):
             return unit[: -len(suffix)].strip()
@@ -26,12 +29,13 @@ def build_daily_load_sheet(
     scheduled_date,
     gallons_per_acre: float,
     tank_sizes: List[float],
+    spot_tank_size: float = 1.0,
 ) -> Dict[str, Any]:
     selected_date = pd.to_datetime(
         scheduled_date
     ).date().isoformat()
 
-    stops = dataframe(
+    base_stops = dataframe(
         """
         SELECT
             dj.id AS dispatch_job_id,
@@ -52,7 +56,7 @@ def build_daily_load_sheet(
         (selected_date,),
     )
 
-    if stops.empty:
+    if base_stops.empty:
         return {
             "summary": {
                 "stops": 0,
@@ -70,7 +74,14 @@ def build_daily_load_sheet(
             te.dispatch_job_id,
             te.id AS treatment_event_id,
             te.treatment_id,
-            td.name AS treatment
+            td.name AS treatment,
+            COALESCE(
+                NULLIF(
+                    LOWER(TRIM(td.application_method)),
+                    ''
+                ),
+                'broadcast'
+            ) AS application_method
         FROM treatment_events te
         INNER JOIN treatment_definitions td
             ON td.id=te.treatment_id
@@ -95,11 +106,26 @@ def build_daily_load_sheet(
             te.dispatch_job_id,
             te.treatment_id,
             td.name AS treatment,
+            COALESCE(
+                NULLIF(
+                    LOWER(TRIM(td.application_method)),
+                    ''
+                ),
+                'broadcast'
+            ) AS application_method,
             p.id AS product_id,
             p.product_name,
             p.epa_number,
-            tp.rate_per_acre,
-            tp.rate_unit
+            COALESCE(
+                NULLIF(tp.rate_per_acre, 0),
+                p.default_rate,
+                0
+            ) AS rate_per_acre,
+            COALESCE(
+                NULLIF(TRIM(tp.rate_unit), ''),
+                NULLIF(TRIM(p.rate_unit), ''),
+                ''
+            ) AS rate_unit
         FROM treatment_events te
         INNER JOIN treatment_definitions td
             ON td.id=te.treatment_id
@@ -122,62 +148,142 @@ def build_daily_load_sheet(
         (selected_date,),
     )
 
-    stops = stops.copy()
+    base_stops = base_stops.copy()
 
-    stops["square_feet"] = pd.to_numeric(
-        stops["square_feet"],
+    base_stops["square_feet"] = pd.to_numeric(
+        base_stops["square_feet"],
         errors="coerce",
     ).fillna(0)
 
-    stops["acres"] = (
-        stops["square_feet"] / 43560.0
+    base_stops["acres"] = (
+        base_stops["square_feet"] / 43560.0
     )
 
-    treatment_groups = {}
+    expanded_stops = []
 
-    if not treatments.empty:
+    for _, stop in base_stops.iterrows():
 
-        for job_id, group in treatments.groupby(
-            "dispatch_job_id"
+        job_id = int(
+            stop["dispatch_job_id"]
+        )
+
+        if treatments.empty:
+            job_treatments = pd.DataFrame()
+        else:
+            job_treatments = treatments[
+                treatments[
+                    "dispatch_job_id"
+                ].astype(int) == job_id
+            ].copy()
+
+        if job_treatments.empty:
+            expanded = stop.to_dict()
+            expanded["mix_group"] = str(
+                stop["treatment_name"]
+                or "Unspecified"
+            )
+            expanded["application_method"] = (
+                "broadcast"
+            )
+            expanded_stops.append(
+                expanded
+            )
+            continue
+
+        job_treatments[
+            "application_method"
+        ] = (
+            job_treatments[
+                "application_method"
+            ]
+            .fillna("broadcast")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+
+        job_treatments.loc[
+            ~job_treatments[
+                "application_method"
+            ].isin(
+                [
+                    "broadcast",
+                    "spot",
+                ]
+            ),
+            "application_method",
+        ] = "broadcast"
+
+        for method, method_treatments in (
+            job_treatments.groupby(
+                "application_method"
+            )
         ):
-
+            expanded = stop.to_dict()
             names = sorted(
-                set(
+                {
                     str(value)
-                    for value in group["treatment"]
+                    for value
+                    in method_treatments[
+                        "treatment"
+                    ]
                     if value
+                }
+            )
+            expanded["mix_group"] = (
+                " + ".join(names)
+                or str(
+                    stop["treatment_name"]
+                    or "Unspecified"
                 )
             )
-
-            treatment_groups[int(job_id)] = (
-                " + ".join(names)
+            expanded[
+                "application_method"
+            ] = method
+            expanded_stops.append(
+                expanded
             )
 
-    stops["mix_group"] = stops.apply(
+    stops = pd.DataFrame(
+        expanded_stops
+    )
+
+    spot_tank_size = max(
+        float(spot_tank_size),
+        0.1,
+    )
+
+    stops["water_gallons"] = stops.apply(
         lambda row: (
-            treatment_groups.get(
-                int(row["dispatch_job_id"]),
-                str(
-                    row["treatment_name"]
-                    or "Unspecified"
-                ),
+            spot_tank_size
+            if row["application_method"] == "spot"
+            else (
+                float(row["acres"])
+                * float(gallons_per_acre)
             )
         ),
         axis=1,
-    )
-
-    stops["water_gallons"] = (
-        stops["acres"]
-        * float(gallons_per_acre)
     )
 
     mix_rows = []
     tank_rows = []
     daily_chemical_rows = []
 
-    for mix_name, mix_stops in stops.groupby(
-        "mix_group"
+    for (
+        mix_name,
+        application_method,
+    ), mix_stops in stops.groupby(
+        [
+            "mix_group",
+            "application_method",
+        ]
     ):
+
+        method_label = (
+            "Spot Treatment"
+            if application_method == "spot"
+            else "Broadcast"
+        )
 
         mix_acres = float(
             mix_stops["acres"].sum()
@@ -190,7 +296,12 @@ def build_daily_load_sheet(
         mix_rows.append(
             {
                 "Treatment Mix": mix_name,
-                "Stops": len(mix_stops),
+                "Application Method": method_label,
+                "Stops": int(
+                    mix_stops[
+                        "dispatch_job_id"
+                    ].nunique()
+                ),
                 "Acres": round(
                     mix_acres,
                     4,
@@ -208,11 +319,28 @@ def build_daily_load_sheet(
             ].astype(int)
         )
 
-        mix_chemicals = chemicals[
-            chemicals[
-                "dispatch_job_id"
-            ].astype(int).isin(job_ids)
-        ].copy() if not chemicals.empty else pd.DataFrame()
+        if chemicals.empty:
+            mix_chemicals = pd.DataFrame()
+        else:
+            chemical_methods = (
+                chemicals[
+                    "application_method"
+                ]
+                .fillna("broadcast")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+            )
+
+            mix_chemicals = chemicals[
+                chemicals[
+                    "dispatch_job_id"
+                ].astype(int).isin(job_ids)
+                & (
+                    chemical_methods
+                    == application_method
+                )
+            ].copy()
 
         chemical_amounts = {}
 
@@ -231,10 +359,38 @@ def build_daily_load_sheet(
                 ].iloc[0]
             )
 
+            job_water = float(
+                mix_stops.loc[
+                    mix_stops[
+                        "dispatch_job_id"
+                    ].astype(int) == job_id,
+                    "water_gallons",
+                ].iloc[0]
+            )
+
+            application_rate = float(
+                chemical["rate_per_acre"]
+                or 0
+            )
+
+            rate_basis = (
+                "Per Gallon"
+                if application_method == "spot"
+                else "Per Acre"
+            )
+
+            basis_quantity = (
+                job_water
+                if application_method == "spot"
+                else job_acres
+            )
+
             key = (
                 int(chemical["product_id"]),
                 str(chemical["product_name"]),
                 str(chemical["epa_number"] or ""),
+                application_rate,
+                rate_basis,
                 str(chemical["rate_unit"] or ""),
             )
 
@@ -243,17 +399,16 @@ def build_daily_load_sheet(
                     key,
                     0.0,
                 )
-                + float(
-                    chemical["rate_per_acre"]
-                    or 0
-                )
-                * job_acres
+                + application_rate
+                * basis_quantity
             )
 
         for (
             product_id,
             product_name,
             epa_number,
+            application_rate,
+            rate_basis,
             rate_unit,
         ), total_amount in chemical_amounts.items():
 
@@ -264,15 +419,24 @@ def build_daily_load_sheet(
             daily_chemical_rows.append(
                 {
                     "Treatment Mix": mix_name,
+                    "Application Method": method_label,
                     "product_id": product_id,
                     "Chemical": product_name,
                     "EPA Number": epa_number,
+                    "Application Rate": application_rate,
+                    "Rate Basis": rate_basis,
                     "Total Amount": total_amount,
                     "Unit": unit,
                 }
             )
 
-        for tank_size in tank_sizes:
+        active_tank_sizes = (
+            [spot_tank_size]
+            if application_method == "spot"
+            else tank_sizes
+        )
+
+        for tank_size in active_tank_sizes:
 
             tank_size = float(
                 tank_size
@@ -303,6 +467,7 @@ def build_daily_load_sheet(
                 tank_rows.append(
                     {
                         "Treatment Mix": mix_name,
+                        "Application Method": method_label,
                         "Tank Size": tank_size,
                         "Loads": loads,
                         "Full Tanks": full_tanks,
@@ -321,6 +486,8 @@ def build_daily_load_sheet(
                 product_id,
                 product_name,
                 epa_number,
+                application_rate,
+                rate_basis,
                 rate_unit,
             ), total_amount in chemical_amounts.items():
 
@@ -333,6 +500,7 @@ def build_daily_load_sheet(
                 tank_rows.append(
                     {
                         "Treatment Mix": mix_name,
+                        "Application Method": method_label,
                         "Tank Size": tank_size,
                         "Loads": loads,
                         "Full Tanks": full_tanks,
@@ -370,8 +538,11 @@ def build_daily_load_sheet(
         chemical_totals = (
             chemical_detail.groupby(
                 [
+                    "Application Method",
                     "Chemical",
                     "EPA Number",
+                    "Application Rate",
+                    "Rate Basis",
                     "Unit",
                 ],
                 as_index=False,
@@ -387,9 +558,13 @@ def build_daily_load_sheet(
 
     return {
         "summary": {
-            "stops": len(stops),
+            "stops": len(base_stops),
             "acres": round(
-                float(stops["acres"].sum()),
+                float(
+                    base_stops[
+                        "acres"
+                    ].sum()
+                ),
                 4,
             ),
             "water_gallons": round(
@@ -415,6 +590,7 @@ def build_daily_load_sheet_html(
     scheduled_date,
     gallons_per_acre: float,
     tank_sizes: List[float],
+    spot_tank_size: float = 1.0,
 ) -> str:
     selected_date = pd.to_datetime(
         scheduled_date
@@ -430,6 +606,10 @@ def build_daily_load_sheet_html(
     tank_description = ", ".join(
         f"{float(size):g} gallon"
         for size in tank_sizes
+    )
+    tank_description += (
+        f"; spot treatment: "
+        f"{float(spot_tank_size):g} gallon"
     )
 
     def table_html(

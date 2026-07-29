@@ -10,6 +10,7 @@ from data.database import (
     dataframe,
     execute,
     get_connection,
+    get_setting,
 )
 
 
@@ -134,6 +135,7 @@ def initialize_treatment_system():
                 window_end TEXT NOT NULL,
                 target_month INTEGER NOT NULL,
                 target_day INTEGER NOT NULL DEFAULT 1,
+                application_method TEXT NOT NULL DEFAULT 'broadcast',
                 active INTEGER DEFAULT 1,
                 notes TEXT,
                 created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -288,6 +290,35 @@ def initialize_treatment_system():
                 """
             )
 
+        treatment_columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(treatment_definitions)"
+            ).fetchall()
+        }
+
+        if "application_method" not in treatment_columns:
+            conn.execute(
+                """
+                ALTER TABLE treatment_definitions
+                ADD COLUMN application_method TEXT
+                NOT NULL DEFAULT 'broadcast'
+                """
+            )
+
+        conn.execute(
+            """
+            UPDATE treatment_definitions
+            SET application_method='broadcast'
+            WHERE application_method IS NULL
+               OR TRIM(application_method)=''
+               OR LOWER(application_method) NOT IN (
+                   'broadcast',
+                   'spot'
+               )
+            """
+        )
+
         employee_columns = {
             row[1]
             for row in conn.execute(
@@ -366,14 +397,29 @@ def save_treatment_definition(
     target_day: int,
     description: str = "",
     standard: bool = True,
+    application_method: str = "broadcast",
     active: bool = True,
     notes: str = "",
     treatment_id: int | None = None,
 ) -> int:
     name = name.strip()
+    application_method = (
+        str(application_method)
+        .strip()
+        .lower()
+    )
 
     if not name:
         raise ValueError("Treatment name is required.")
+
+    if application_method not in {
+        "broadcast",
+        "spot",
+    }:
+        raise ValueError(
+            "Application method must be Broadcast "
+            "or Spot Treatment."
+        )
 
     existing = get_treatment_definitions()
 
@@ -414,10 +460,11 @@ def save_treatment_definition(
                 window_end,
                 target_month,
                 target_day,
+                application_method,
                 active,
                 notes
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
@@ -427,6 +474,7 @@ def save_treatment_definition(
                 window_end,
                 int(target_month),
                 int(target_day),
+                application_method,
                 int(active),
                 notes,
             ),
@@ -443,6 +491,7 @@ def save_treatment_definition(
             window_end=?,
             target_month=?,
             target_day=?,
+            application_method=?,
             active=?,
             notes=?
         WHERE id=?
@@ -455,6 +504,7 @@ def save_treatment_definition(
             window_end,
             int(target_month),
             int(target_day),
+            application_method,
             int(active),
             notes,
             int(treatment_id),
@@ -476,8 +526,16 @@ def get_treatment_products(
             p.product_name,
             p.product_type,
             p.epa_number,
-            tp.rate_per_acre,
-            tp.rate_unit
+            COALESCE(
+                NULLIF(tp.rate_per_acre, 0),
+                p.default_rate,
+                0
+            ) AS rate_per_acre,
+            COALESCE(
+                NULLIF(TRIM(tp.rate_unit), ''),
+                NULLIF(TRIM(p.rate_unit), ''),
+                ''
+            ) AS rate_unit
         FROM treatment_products tp
         INNER JOIN products p
             ON p.id = tp.product_id
@@ -640,6 +698,7 @@ def get_treatment_events(
             td.name AS treatment,
             td.window_start,
             td.window_end,
+            td.application_method,
             te.due_date,
             te.status,
             te.event_type,
@@ -731,6 +790,7 @@ def get_dispatch_treatment_events(
             te.customer_id,
             te.treatment_id,
             td.name AS treatment,
+            td.application_method,
             c.name AS customer,
             c.square_feet
         FROM treatment_events te
@@ -779,7 +839,8 @@ def complete_treatment_event(
             te.customer_id,
             te.treatment_id,
             c.square_feet,
-            td.name AS treatment_name
+            td.name AS treatment_name,
+            td.application_method
         FROM treatment_events te
         INNER JOIN customers c
             ON c.id = te.customer_id
@@ -839,6 +900,34 @@ def complete_treatment_event(
 
     acres = square_feet / 43560.0
 
+    application_method = str(
+        event.get(
+            "application_method",
+            "broadcast",
+        )
+        or "broadcast"
+    ).strip().lower()
+
+    try:
+        spot_batch_gallons = float(
+            get_setting(
+                "spot_tank_gallons",
+                "1.0",
+            )
+            or 1.0
+        )
+    except (TypeError, ValueError):
+        spot_batch_gallons = 1.0
+
+    rate_basis_quantity = (
+        max(
+            spot_batch_gallons,
+            0.1,
+        )
+        if application_method == "spot"
+        else acres
+    )
+
     chemicals = get_treatment_products(
         int(event["treatment_id"])
     )
@@ -891,7 +980,10 @@ def complete_treatment_event(
                 chemical["rate_per_acre"] or 0
             )
 
-            calculated_amount = rate * acres
+            calculated_amount = (
+                rate
+                * rate_basis_quantity
+            )
 
             actual_amount = float(
                 actual_amounts.get(
@@ -1039,19 +1131,52 @@ def calculate_mixture(
     gallons_per_acre: float,
     tank_gallons: float,
 ) -> pd.DataFrame:
+    definition = dataframe(
+        """
+        SELECT application_method
+        FROM treatment_definitions
+        WHERE id=?
+        """,
+        (int(treatment_id),),
+    )
+
+    application_method = (
+        "broadcast"
+        if definition.empty
+        else str(
+            definition.iloc[0][
+                "application_method"
+            ]
+            or "broadcast"
+        ).strip().lower()
+    )
+
     products = get_treatment_products(
         treatment_id
     )
 
+    is_spot_treatment = (
+        application_method == "spot"
+    )
+
     total_spray_gallons = (
-        float(acres) * float(gallons_per_acre)
+        float(tank_gallons)
+        if is_spot_treatment
+        else (
+            float(acres)
+            * float(gallons_per_acre)
+        )
     )
 
     rows = []
 
     for _, product in products.iterrows():
         rate = float(product["rate_per_acre"])
-        total_product = rate * float(acres)
+        total_product = (
+            rate * total_spray_gallons
+            if is_spot_treatment
+            else rate * float(acres)
+        )
 
         if total_spray_gallons > 0:
             product_per_gallon = (
@@ -1067,7 +1192,12 @@ def calculate_mixture(
         rows.append(
             {
                 "Product": product["product_name"],
-                "Rate Per Acre": rate,
+                "Application Rate": rate,
+                "Rate Basis": (
+                    "Per Gallon"
+                    if is_spot_treatment
+                    else "Per Acre"
+                ),
                 "Unit": product["rate_unit"],
                 "Total Product": round(
                     total_product,

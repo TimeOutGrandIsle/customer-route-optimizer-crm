@@ -23,6 +23,7 @@ from core.treatment_manager import (
 from data.database import (
     get_customers,
     get_products,
+    get_setting,
 )
 
 
@@ -237,6 +238,44 @@ def render():
                     property_square_feet / 43560.0
                 )
 
+                application_method = str(
+                    selected_event.get(
+                        "application_method",
+                        "broadcast",
+                    )
+                    or "broadcast"
+                ).strip().lower()
+
+                is_spot_completion = (
+                    application_method == "spot"
+                )
+
+                try:
+                    spot_batch_gallons = float(
+                        get_setting(
+                            "spot_tank_gallons",
+                            "1.0",
+                        )
+                        or 1.0
+                    )
+                except (TypeError, ValueError):
+                    spot_batch_gallons = 1.0
+
+                completion_rate_label = (
+                    "Rate Per Gallon"
+                    if is_spot_completion
+                    else "Rate Per Acre"
+                )
+
+                rate_basis_quantity = (
+                    max(
+                        spot_batch_gallons,
+                        0.1,
+                    )
+                    if is_spot_completion
+                    else property_acres
+                )
+
                 actual_rows = []
 
                 for _, chemical in treatment_chemicals.iterrows():
@@ -245,7 +284,7 @@ def render():
                         float(
                             chemical["rate_per_acre"] or 0
                         )
-                        * property_acres
+                        * rate_basis_quantity
                     )
 
                     actual_rows.append(
@@ -259,7 +298,7 @@ def render():
                             "EPA Number": chemical[
                                 "epa_number"
                             ],
-                            "Rate Per Acre": float(
+                            completion_rate_label: float(
                                 chemical[
                                     "rate_per_acre"
                                 ]
@@ -296,7 +335,7 @@ def render():
                                 "product_id",
                                 "Chemical",
                                 "EPA Number",
-                                "Rate Per Acre",
+                                completion_rate_label,
                                 "Unit",
                                 "Calculated Total",
                             ],
@@ -437,6 +476,24 @@ def render():
             else bool(selected_definition["standard"])
         )
 
+        default_application_method = (
+            "broadcast"
+            if selected_definition is None
+            else str(
+                selected_definition.get(
+                    "application_method",
+                    "broadcast",
+                )
+                or "broadcast"
+            ).strip().lower()
+        )
+
+        if default_application_method not in {
+            "broadcast",
+            "spot",
+        }:
+            default_application_method = "broadcast"
+
         default_active = (
             True
             if selected_definition is None
@@ -499,6 +556,29 @@ def render():
                 value=default_standard,
             )
 
+            application_method = st.selectbox(
+                "Application Method",
+                options=[
+                    "broadcast",
+                    "spot",
+                ],
+                index=(
+                    1
+                    if default_application_method == "spot"
+                    else 0
+                ),
+                format_func=lambda value: (
+                    "Spot Treatment"
+                    if value == "spot"
+                    else "Broadcast"
+                ),
+                help=(
+                    "Broadcast treatments use lawn acreage "
+                    "and gallons per acre. Spot treatments "
+                    "use the configured spot-treatment batch."
+                ),
+            )
+
             active_treatment = st.checkbox(
                 "Treatment is active",
                 value=default_active,
@@ -531,6 +611,7 @@ def render():
                     window_end=window_end,
                     target_month=int(target_month),
                     target_day=int(target_day),
+                    application_method=application_method,
                     active=active_treatment,
                     notes=treatment_notes,
                     treatment_id=treatment_id,
@@ -575,6 +656,41 @@ def render():
                 key="chemical_treatment_selection",
             )
 
+            chemical_definition = definitions[
+                definitions["id"].astype(int)
+                == int(chemical_treatment_id)
+            ].iloc[0]
+
+            chemical_application_method = str(
+                chemical_definition.get(
+                    "application_method",
+                    "broadcast",
+                )
+                or "broadcast"
+            ).strip().lower()
+
+            is_spot_treatment = (
+                chemical_application_method == "spot"
+            )
+
+            rate_column_label = (
+                "Rate Per Gallon"
+                if is_spot_treatment
+                else "Rate Per Acre"
+            )
+
+            st.caption(
+                (
+                    "Enter each chemical amount per gallon "
+                    "of finished spot-treatment mixture."
+                )
+                if is_spot_treatment
+                else (
+                    "Enter each chemical amount applied "
+                    "per treated acre."
+                )
+            )
+
             assigned = get_treatment_products(
                 chemical_treatment_id
             )
@@ -599,17 +715,90 @@ def render():
                 ),
             )
 
+            product_defaults = {}
+
+            for _, product in products.iterrows():
+
+                product_id = int(product["id"])
+
+                default_rate = pd.to_numeric(
+                    product.get(
+                        "default_rate",
+                        0,
+                    ),
+                    errors="coerce",
+                )
+
+                if pd.isna(default_rate):
+                    default_rate = 0.0
+
+                default_unit = product.get(
+                    "rate_unit",
+                    "",
+                )
+
+                if pd.isna(default_unit):
+                    default_unit = ""
+
+                product_defaults[product_id] = {
+                    "rate": float(default_rate),
+                    "unit": (
+                        str(default_unit).strip()
+                        or "oz"
+                    ),
+                }
+
             existing_rates = {}
 
             if not assigned.empty:
 
-                existing_rates = {
-                    int(row["product_id"]): {
-                        "rate": float(row["rate_per_acre"]),
-                        "unit": str(row["rate_unit"]),
+                for _, row in assigned.iterrows():
+
+                    product_id = int(
+                        row["product_id"]
+                    )
+
+                    library_default = (
+                        product_defaults.get(
+                            product_id,
+                            {
+                                "rate": 0.0,
+                                "unit": "oz",
+                            },
+                        )
+                    )
+
+                    assigned_rate = pd.to_numeric(
+                        row.get(
+                            "rate_per_acre",
+                            0,
+                        ),
+                        errors="coerce",
+                    )
+
+                    if (
+                        pd.isna(assigned_rate)
+                        or float(assigned_rate) == 0
+                    ):
+                        assigned_rate = (
+                            library_default["rate"]
+                        )
+
+                    assigned_unit = row.get(
+                        "rate_unit",
+                        "",
+                    )
+
+                    if pd.isna(assigned_unit):
+                        assigned_unit = ""
+
+                    existing_rates[product_id] = {
+                        "rate": float(assigned_rate),
+                        "unit": (
+                            str(assigned_unit).strip()
+                            or library_default["unit"]
+                        ),
                     }
-                    for _, row in assigned.iterrows()
-                }
 
             rate_rows = []
 
@@ -617,17 +806,20 @@ def render():
 
                 defaults = existing_rates.get(
                     int(product_id),
-                    {
-                        "rate": 0.0,
-                        "unit": "oz",
-                    },
+                    product_defaults.get(
+                        int(product_id),
+                        {
+                            "rate": 0.0,
+                            "unit": "oz",
+                        },
+                    ),
                 )
 
                 rate_rows.append(
                     {
                         "product_id": int(product_id),
                         "Product": product_labels[product_id],
-                        "Rate Per Acre": defaults["rate"],
+                        rate_column_label: defaults["rate"],
                         "Unit": defaults["unit"],
                     }
                 )
@@ -646,9 +838,9 @@ def render():
                     ],
                     column_config={
                         "product_id": None,
-                        "Rate Per Acre": (
+                        rate_column_label: (
                             st.column_config.NumberColumn(
-                                "Rate Per Acre",
+                                rate_column_label,
                                 min_value=0.0,
                                 format="%.4f",
                             )
@@ -660,7 +852,8 @@ def render():
                     },
                     key=(
                         "treatment_rates_"
-                        f"{chemical_treatment_id}"
+                        f"{chemical_treatment_id}_"
+                        f"{chemical_application_method}"
                     ),
                 )
 
@@ -688,7 +881,7 @@ def render():
                                 row["product_id"]
                             ),
                             "rate_per_acre": float(
-                                row["Rate Per Acre"]
+                                row[rate_column_label]
                             ),
                             "rate_unit": str(
                                 row["Unit"]
@@ -1000,35 +1193,83 @@ def render():
                 key="mixture_treatment",
             )
 
-            property_col, spray_col, tank_col = st.columns(3)
+            mixture_definition = definitions[
+                definitions["id"].astype(int)
+                == int(mixture_treatment_id)
+            ].iloc[0]
 
-            square_feet = property_col.number_input(
-                "Property Square Feet",
-                min_value=0.0,
-                value=43560.0,
-                step=1000.0,
-            )
+            mixture_method = str(
+                mixture_definition.get(
+                    "application_method",
+                    "broadcast",
+                )
+                or "broadcast"
+            ).strip().lower()
 
-            gallons_per_acre = spray_col.number_input(
-                "Spray Gallons Per Acre",
-                min_value=0.01,
-                value=20.0,
-                step=1.0,
-            )
+            if mixture_method == "spot":
 
-            tank_gallons = tank_col.number_input(
-                "Sprayer Tank Gallons",
-                min_value=0.01,
-                value=25.0,
-                step=1.0,
-            )
+                try:
+                    default_spot_batch = float(
+                        get_setting(
+                            "spot_tank_gallons",
+                            "1.0",
+                        )
+                        or 1.0
+                    )
+                except (TypeError, ValueError):
+                    default_spot_batch = 1.0
 
-            acres = square_feet / 43560.0
+                tank_gallons = st.number_input(
+                    "Spot Treatment Batch Gallons",
+                    min_value=0.1,
+                    value=default_spot_batch,
+                    step=0.25,
+                )
 
-            st.metric(
-                "Calculated Acres",
-                round(acres, 4),
-            )
+                square_feet = 0.0
+                acres = 0.0
+                gallons_per_acre = 1.0
+
+                st.metric(
+                    "Finished Spot Mixture",
+                    f"{tank_gallons:g} gallons",
+                )
+
+            else:
+
+                property_col, spray_col, tank_col = (
+                    st.columns(3)
+                )
+
+                square_feet = property_col.number_input(
+                    "Property Square Feet",
+                    min_value=0.0,
+                    value=43560.0,
+                    step=1000.0,
+                )
+
+                gallons_per_acre = (
+                    spray_col.number_input(
+                        "Spray Gallons Per Acre",
+                        min_value=0.01,
+                        value=20.0,
+                        step=1.0,
+                    )
+                )
+
+                tank_gallons = tank_col.number_input(
+                    "Sprayer Tank Gallons",
+                    min_value=0.01,
+                    value=25.0,
+                    step=1.0,
+                )
+
+                acres = square_feet / 43560.0
+
+                st.metric(
+                    "Calculated Acres",
+                    round(acres, 4),
+                )
 
             mixture = calculate_mixture(
                 treatment_id=mixture_treatment_id,
