@@ -20,7 +20,6 @@ from core.crm import (
 
 from core.crm import (
     list_dispatch_jobs,
-    optimize_dispatch_route,
     get_depot,
 )
 
@@ -193,9 +192,15 @@ def build_queue_from_customers(customers: List[Dict[str, Any]]) -> List[Dict[str
 
 def clear_queue() -> None:
     """
-    Cancel today's active queue and release treatments.
+    Cancel every active queue across all scheduled dates
+    and release linked planned treatments.
     """
-    jobs = get_dispatch_queue()
+    jobs = [
+        job
+        for job in get_all_dispatch_jobs()
+        if str(job.get("status", "")).lower()
+        in {"queued", "in_progress"}
+    ]
 
     for job in jobs:
 
@@ -208,12 +213,19 @@ def clear_queue() -> None:
 # ROUTE BUILDING
 # ==========================================================
 
-def build_daily_route() -> List[Dict[str, Any]]:
+def build_daily_route(
+    scheduled_date=None,
+) -> List[Dict[str, Any]]:
     """
-    Returns today's optimized route from queued jobs.
+    Returns an optimized route from the same active,
+    date-filtered queue displayed on the Dispatch tab.
     """
 
-    return optimize_dispatch_route()
+    return build_route_from_queue(
+        get_dispatch_queue(
+            scheduled_date=scheduled_date
+        )
+    )
 
 
 def build_route_from_queue(
@@ -370,10 +382,33 @@ def mark_job_cancelled(
 
 def cancel_entire_queue():
     """
-    Cancel today's active queue and return planned
-    treatments to Scheduling.
+    Cancel every active queue across all scheduled dates
+    and return planned treatments to Scheduling.
     """
-    jobs = get_dispatch_queue()
+    jobs = [
+        job
+        for job in get_all_dispatch_jobs()
+        if str(job.get("status", "")).lower()
+        in {"queued", "in_progress"}
+    ]
+
+    for job in jobs:
+
+        mark_job_cancelled(
+            int(job["id"])
+        )
+
+
+def cancel_queue_for_date(
+    scheduled_date=None,
+):
+    """
+    Cancel the active queue for one scheduled date and
+    return linked planned treatments to Scheduling.
+    """
+    jobs = get_dispatch_queue(
+        scheduled_date=scheduled_date
+    )
 
     for job in jobs:
 
@@ -582,13 +617,28 @@ def dispatch_statistics() -> Dict[str, Any]:
     }
 
 
-def dispatch_dashboard() -> Dict[str, Any]:
+def dispatch_dashboard(
+    scheduled_date=None,
+) -> Dict[str, Any]:
     """
-    Build the route once and reuse it for every dashboard view.
+    Build one selected-date queue and reuse it for every
+    dashboard view.
     """
-    queued_jobs = get_dispatch_queue()
+    selected_date = (
+        pd.to_datetime(
+            scheduled_date or date.today()
+        )
+        .date()
+        .isoformat()
+    )
+
+    queued_jobs = get_dispatch_queue(
+        scheduled_date=selected_date
+    )
     all_jobs = get_all_dispatch_jobs()
-    route = build_daily_route()
+    route = build_route_from_queue(
+        queued_jobs
+    )
 
     if route:
         summary = route_summary(route)
@@ -619,8 +669,38 @@ def dispatch_dashboard() -> Dict[str, Any]:
         if status in status_counts:
             status_counts[status] += 1
 
+    future_active = 0
+
+    for job in all_jobs:
+
+        status = str(
+            job.get("status", "")
+        ).lower()
+
+        if status not in {
+            "queued",
+            "in_progress",
+        }:
+            continue
+
+        job_date = pd.to_datetime(
+            job.get("scheduled_date"),
+            errors="coerce",
+        )
+
+        if (
+            not pd.isna(job_date)
+            and job_date.date() > date.today()
+        ):
+            future_active += 1
+
     statistics = {
         **status_counts,
+        "selected_date": selected_date,
+        "selected_date_active": len(
+            queued_jobs
+        ),
+        "future_active": future_active,
         "route": summary,
     }
 
@@ -663,6 +743,8 @@ __all__ = [
     "mark_job_cancelled",
 
     "cancel_entire_queue",
+
+    "cancel_queue_for_date",
 
     "complete_entire_queue",
 
