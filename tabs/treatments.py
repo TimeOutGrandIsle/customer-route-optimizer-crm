@@ -491,6 +491,7 @@ def render():
         if default_application_method not in {
             "broadcast",
             "spot",
+            "granular",
         }:
             default_application_method = "broadcast"
 
@@ -561,21 +562,29 @@ def render():
                 options=[
                     "broadcast",
                     "spot",
+                    "granular",
                 ],
-                index=(
-                    1
-                    if default_application_method == "spot"
-                    else 0
+                index=[
+                    "broadcast",
+                    "spot",
+                    "granular",
+                ].index(
+                    default_application_method
                 ),
                 format_func=lambda value: (
                     "Spot Treatment"
                     if value == "spot"
-                    else "Broadcast"
+                    else (
+                        "Granular Broadcast"
+                        if value == "granular"
+                        else "Liquid Broadcast"
+                    )
                 ),
                 help=(
-                    "Broadcast treatments use lawn acreage "
-                    "and gallons per acre. Spot treatments "
-                    "use the configured spot-treatment batch."
+                    "Liquid Broadcast uses acreage and water "
+                    "GPA. Spot Treatment uses a saved liquid "
+                    "batch. Granular Broadcast uses acreage "
+                    "without water or tanks."
                 ),
             )
 
@@ -673,6 +682,10 @@ def render():
                 chemical_application_method == "spot"
             )
 
+            is_granular_treatment = (
+                chemical_application_method == "granular"
+            )
+
             rate_column_label = (
                 "Rate Per Gallon"
                 if is_spot_treatment
@@ -686,6 +699,11 @@ def render():
                 )
                 if is_spot_treatment
                 else (
+                    "Enter each granular product amount "
+                    "applied per treated acre, such as "
+                    "pounds per acre."
+                    if is_granular_treatment
+                    else
                     "Enter each chemical amount applied "
                     "per treated acre."
                 )
@@ -1233,6 +1251,29 @@ def render():
                 st.metric(
                     "Finished Spot Mixture",
                     f"{tank_gallons:g} gallons",
+                )
+
+            elif mixture_method == "granular":
+
+                square_feet = st.number_input(
+                    "Property Square Feet",
+                    min_value=0.0,
+                    value=43560.0,
+                    step=1000.0,
+                )
+
+                acres = square_feet / 43560.0
+                gallons_per_acre = 0.0
+                tank_gallons = 0.0
+
+                st.metric(
+                    "Calculated Acres",
+                    round(acres, 4),
+                )
+
+                st.caption(
+                    "Granular product totals are calculated "
+                    "by acreage without water or tank loads."
                 )
 
             else:

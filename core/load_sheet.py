@@ -64,6 +64,7 @@ def build_daily_load_sheet(
                 "water_gallons": 0,
             },
             "chemical_totals": pd.DataFrame(),
+            "granular_product_load": pd.DataFrame(),
             "mix_summary": pd.DataFrame(),
             "tank_plan": pd.DataFrame(),
         }
@@ -209,6 +210,7 @@ def build_daily_load_sheet(
                 [
                     "broadcast",
                     "spot",
+                    "granular",
                 ]
             ),
             "application_method",
@@ -255,11 +257,15 @@ def build_daily_load_sheet(
 
     stops["water_gallons"] = stops.apply(
         lambda row: (
-            spot_tank_size
-            if row["application_method"] == "spot"
+            0.0
+            if row["application_method"] == "granular"
             else (
-                float(row["acres"])
-                * float(gallons_per_acre)
+                spot_tank_size
+                if row["application_method"] == "spot"
+                else (
+                    float(row["acres"])
+                    * float(gallons_per_acre)
+                )
             )
         ),
         axis=1,
@@ -282,7 +288,11 @@ def build_daily_load_sheet(
         method_label = (
             "Spot Treatment"
             if application_method == "spot"
-            else "Broadcast"
+            else (
+                "Granular Broadcast"
+                if application_method == "granular"
+                else "Liquid Broadcast"
+            )
         )
 
         mix_acres = float(
@@ -433,7 +443,11 @@ def build_daily_load_sheet(
         active_tank_sizes = (
             [spot_tank_size]
             if application_method == "spot"
-            else tank_sizes
+            else (
+                []
+                if application_method == "granular"
+                else tank_sizes
+            )
         )
 
         for tank_size in active_tank_sizes:
@@ -532,29 +546,75 @@ def build_daily_load_sheet(
     if chemical_detail.empty:
 
         chemical_totals = pd.DataFrame()
+        granular_product_load = pd.DataFrame()
 
     else:
 
+        total_group_columns = [
+            "Application Method",
+            "Chemical",
+            "EPA Number",
+            "Application Rate",
+            "Rate Basis",
+            "Unit",
+        ]
+
+        liquid_detail = chemical_detail[
+            chemical_detail[
+                "Application Method"
+            ] != "Granular Broadcast"
+        ]
+
+        granular_detail = chemical_detail[
+            chemical_detail[
+                "Application Method"
+            ] == "Granular Broadcast"
+        ]
+
         chemical_totals = (
-            chemical_detail.groupby(
-                [
-                    "Application Method",
-                    "Chemical",
-                    "EPA Number",
-                    "Application Rate",
-                    "Rate Basis",
-                    "Unit",
-                ],
-                as_index=False,
-            )["Total Amount"]
-            .sum()
+            pd.DataFrame()
+            if liquid_detail.empty
+            else (
+                liquid_detail.groupby(
+                    total_group_columns,
+                    as_index=False,
+                )["Total Amount"]
+                .sum()
+            )
         )
 
-        chemical_totals[
-            "Total Amount"
-        ] = chemical_totals[
-            "Total Amount"
-        ].round(4)
+        granular_product_load = (
+            pd.DataFrame()
+            if granular_detail.empty
+            else (
+                granular_detail.groupby(
+                    total_group_columns,
+                    as_index=False,
+                )["Total Amount"]
+                .sum()
+                .rename(
+                    columns={
+                        "Total Amount": (
+                            "Total Product"
+                        )
+                    }
+                )
+            )
+        )
+
+        if not chemical_totals.empty:
+            chemical_totals[
+                "Total Amount"
+            ] = chemical_totals[
+                "Total Amount"
+            ].round(4)
+
+        if not granular_product_load.empty:
+            granular_product_load[
+                "Total Product"
+            ] = granular_product_load[
+                "Total Product"
+            ].round(4)
 
     return {
         "summary": {
@@ -577,6 +637,9 @@ def build_daily_load_sheet(
             ),
         },
         "chemical_totals": chemical_totals,
+        "granular_product_load": (
+            granular_product_load
+        ),
         "mix_summary": pd.DataFrame(
             mix_rows
         ),
@@ -601,6 +664,10 @@ def build_daily_load_sheet_html(
     chemical_totals = load_sheet[
         "chemical_totals"
     ]
+    granular_product_load = load_sheet.get(
+        "granular_product_load",
+        pd.DataFrame(),
+    )
     tank_plan = load_sheet["tank_plan"]
 
     tank_description = ", ".join(
@@ -746,6 +813,12 @@ def build_daily_load_sheet_html(
 {table_html(
     chemical_totals,
     "No chemicals are assigned."
+)}
+
+<h2>Granular Product Load</h2>
+{table_html(
+    granular_product_load,
+    "No granular products are scheduled."
 )}
 
 <h2>Tank Load Breakdown</h2>

@@ -314,7 +314,8 @@ def initialize_treatment_system():
                OR TRIM(application_method)=''
                OR LOWER(application_method) NOT IN (
                    'broadcast',
-                   'spot'
+                   'spot',
+                   'granular'
                )
             """
         )
@@ -415,10 +416,11 @@ def save_treatment_definition(
     if application_method not in {
         "broadcast",
         "spot",
+        "granular",
     }:
         raise ValueError(
-            "Application method must be Broadcast "
-            "or Spot Treatment."
+            "Application method must be Liquid Broadcast, "
+            "Spot Treatment, or Granular Broadcast."
         )
 
     existing = get_treatment_definitions()
@@ -1159,12 +1161,20 @@ def calculate_mixture(
         application_method == "spot"
     )
 
+    is_granular_treatment = (
+        application_method == "granular"
+    )
+
     total_spray_gallons = (
-        float(tank_gallons)
-        if is_spot_treatment
+        0.0
+        if is_granular_treatment
         else (
-            float(acres)
-            * float(gallons_per_acre)
+            float(tank_gallons)
+            if is_spot_treatment
+            else (
+                float(acres)
+                * float(gallons_per_acre)
+            )
         )
     )
 
@@ -1177,6 +1187,25 @@ def calculate_mixture(
             if is_spot_treatment
             else rate * float(acres)
         )
+
+        if is_granular_treatment:
+
+            rows.append(
+                {
+                    "Product": product[
+                        "product_name"
+                    ],
+                    "Application Rate": rate,
+                    "Rate Basis": "Per Acre",
+                    "Unit": product["rate_unit"],
+                    "Total Product": round(
+                        total_product,
+                        4,
+                    ),
+                }
+            )
+
+            continue
 
         if total_spray_gallons > 0:
             product_per_gallon = (
