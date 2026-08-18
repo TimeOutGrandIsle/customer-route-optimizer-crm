@@ -14,7 +14,9 @@ from data.database import (
 )
 
 
-MAX_TREATMENTS = 10
+# Kept for compatibility with tabs/treatments.py.
+# This is display-only; treatment definitions are unlimited.
+MAX_TREATMENTS = "Unlimited"
 
 def save_product_definition(
     product_name: str,
@@ -172,7 +174,7 @@ def initialize_treatment_system():
                     REFERENCES customers(id)
                     ON DELETE CASCADE,
                 FOREIGN KEY(dispatch_job_id)
-                    REFERENCES dispatch_jobs(id),                
+                    REFERENCES dispatch_jobs(id),
                 FOREIGN KEY(treatment_id)
                     REFERENCES treatment_definitions(id)
                     ON DELETE CASCADE,
@@ -265,7 +267,6 @@ def initialize_treatment_system():
 
             CREATE INDEX IF NOT EXISTS idx_application_date
             ON application_records(application_date);
-
 
             CREATE INDEX IF NOT EXISTS idx_treatment_event_due
             ON treatment_events(due_date, status);
@@ -403,6 +404,12 @@ def save_treatment_definition(
     notes: str = "",
     treatment_id: int | None = None,
 ) -> int:
+    """
+    Create or update a treatment definition.
+
+    Treatment types are unlimited. The former hard-coded 10-treatment cap
+    has been removed.
+    """
     name = name.strip()
     application_method = (
         str(application_method)
@@ -445,11 +452,6 @@ def save_treatment_definition(
             raise ValueError(
                 "Another treatment already uses this name."
             )
-
-    if treatment_id is None and len(existing) >= MAX_TREATMENTS:
-        raise ValueError(
-            "A maximum of 10 treatment types is allowed."
-        )
 
     if treatment_id is None:
         return execute(
@@ -713,7 +715,7 @@ def get_treatment_events(
         INNER JOIN treatment_definitions td
             ON td.id = te.treatment_id
         LEFT JOIN dispatch_jobs dj
-            ON dj.id = te.dispatch_job_id            
+            ON dj.id = te.dispatch_job_id
     """
 
     if not include_completed:
@@ -859,7 +861,7 @@ def complete_treatment_event(
         )
 
     event = events.iloc[0]
-    
+
     applicator_name = ""
     applicator_id_number = ""
 

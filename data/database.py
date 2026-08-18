@@ -588,7 +588,7 @@ def get_next_customer_number(
             conn.close()
 
 
-def add_customer(
+def _legacy_add_customer(
 
     customer_number=None,
 
@@ -3036,3 +3036,864 @@ init_db()
 #     create_treatment_plans_table()
 #     create_chemical_costs_table()
 #
+
+
+# ==========================================================
+# CRM V3 EXTENSIONS
+# ==========================================================
+# These extensions preserve the existing Supabase/PostgreSQL database layer
+# while adding customer categories, crews, persistent dispatch manifests,
+# field-status timestamps, and saved table preferences.
+
+CUSTOMER_TYPES = (
+    "Residential",
+    "Small Commercial",
+    "Commercial",
+)
+
+
+def _column_names(table_name: str) -> set[str]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            f"PRAGMA table_info({table_name})"
+        ).fetchall()
+        return {row[1] for row in rows}
+    finally:
+        conn.close()
+
+
+def _add_column_if_missing(
+    table_name: str,
+    column_name: str,
+    definition: str,
+):
+    if column_name in _column_names(table_name):
+        return
+    execute(
+        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
+    )
+
+
+def init_extended_schema():
+    # Customer organization fields.
+    _add_column_if_missing(
+        "customers",
+        "customer_type",
+        "TEXT DEFAULT 'Residential'",
+    )
+    _add_column_if_missing(
+        "customers",
+        "account_name",
+        "TEXT",
+    )
+
+    # Dispatch field-status / assignment fields.
+    for name, definition in {
+        "arrived_time": "TEXT",
+        "completed_time": "TEXT",
+        "dispatch_id": "INTEGER",
+        "crew_id": "INTEGER",
+        "route_number": "INTEGER",
+        "stop_number": "INTEGER",
+    }.items():
+        _add_column_if_missing(
+            "dispatch_jobs",
+            name,
+            definition,
+        )
+
+    execute(
+        """
+        UPDATE customers
+        SET customer_type='Residential'
+        WHERE customer_type IS NULL
+           OR TRIM(customer_type)=''
+        """
+    )
+
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS crews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crew_name TEXT NOT NULL UNIQUE,
+            email TEXT,
+            phone TEXT,
+            active INTEGER DEFAULT 1,
+            notes TEXT,
+            created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS dispatches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dispatch_date TEXT NOT NULL,
+            crew_id INTEGER,
+            route_number INTEGER,
+            status TEXT DEFAULT 'ready',
+            dispatch_token TEXT UNIQUE,
+            sent_at TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            notes TEXT,
+            created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(crew_id) REFERENCES crews(id)
+        )
+        """
+    )
+
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS table_preferences (
+            table_name TEXT PRIMARY KEY,
+            column_order_json TEXT,
+            hidden_columns_json TEXT,
+            sort_json TEXT,
+            updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_customers_customer_type
+        ON customers(customer_type)
+        """
+    )
+    execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_dispatch_jobs_dispatch_id
+        ON dispatch_jobs(dispatch_id)
+        """
+    )
+    execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_dispatch_jobs_crew_id
+        ON dispatch_jobs(crew_id)
+        """
+    )
+
+
+def add_customer(
+    customer_number=None,
+    name=None,
+    address=None,
+    street_address=None,
+    city=None,
+    state=None,
+    zip=None,
+    county=None,
+    phone=None,
+    email=None,
+    text_phone=None,
+    square_feet=None,
+    turf_type=None,
+    irrigation=None,
+    payment_method=None,
+    quote=None,
+    active=1,
+    special_instructions=None,
+    lat=None,
+    lng=None,
+    neighborhood=None,
+    cluster_id=0,
+    distance_from_cluster=0,
+    service=None,
+    last_service=None,
+    customer_type="Residential",
+    account_name=None,
+):
+    """Add a customer while remaining compatible with legacy callers."""
+    if not name or not str(name).strip():
+        raise ValueError("Customer name is required.")
+
+    if customer_type not in CUSTOMER_TYPES:
+        raise ValueError(
+            "customer_type must be Residential, Small Commercial, or Commercial."
+        )
+
+    if not address:
+        parts = [street_address, city, state, zip]
+        address = ", ".join(
+            str(value).strip()
+            for value in parts
+            if value not in (None, "")
+        )
+
+    conn = get_connection()
+    try:
+        if customer_number is None or not str(customer_number).strip():
+            customer_number = get_next_customer_number(conn)
+
+        cursor = conn.execute(
+            """
+            INSERT INTO customers (
+                customer_number,
+                name,
+                account_name,
+                customer_type,
+                address,
+                street_address,
+                city,
+                state,
+                zip,
+                county,
+                phone,
+                email,
+                text_phone,
+                square_feet,
+                turf_type,
+                irrigation,
+                payment_method,
+                quote,
+                active,
+                special_instructions,
+                lat,
+                lng,
+                neighborhood,
+                cluster_id,
+                distance_from_cluster,
+                service,
+                last_service
+            )
+            VALUES (
+                ?,?,?,?,?,?,?,?,?,?,
+                ?,?,?,?,?,?,?,?,?,?,
+                ?,?,?,?,?,?,?
+            )
+            """,
+            (
+                customer_number,
+                str(name).strip(),
+                account_name,
+                customer_type,
+                address,
+                street_address,
+                city,
+                state,
+                zip,
+                county,
+                phone,
+                email,
+                text_phone,
+                square_feet,
+                turf_type,
+                irrigation,
+                payment_method,
+                quote,
+                int(bool(active)),
+                special_instructions,
+                lat,
+                lng,
+                neighborhood,
+                cluster_id,
+                distance_from_cluster,
+                service,
+                last_service,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_customers_by_type(
+    customer_type: str,
+    active_only: bool = True,
+) -> pd.DataFrame:
+    if customer_type not in CUSTOMER_TYPES:
+        raise ValueError(f"Unknown customer type: {customer_type}")
+
+    sql = """
+        SELECT *
+        FROM customers
+        WHERE customer_type=?
+    """
+    params = [customer_type]
+
+    if active_only:
+        sql += " AND active=1"
+
+    sql += " ORDER BY name"
+    return dataframe(sql, tuple(params))
+
+
+def set_customer_type(
+    customer_id: int,
+    customer_type: str,
+):
+    if customer_type not in CUSTOMER_TYPES:
+        raise ValueError(f"Unknown customer type: {customer_type}")
+    update_customer(
+        int(customer_id),
+        customer_type=customer_type,
+    )
+
+
+def get_queued_dispatch_jobs(
+    customer_type: str | None = None,
+) -> pd.DataFrame:
+    """Every queued job is Dispatch-ready regardless of scheduled_date."""
+    sql = """
+        SELECT
+            dj.*,
+            c.customer_number,
+            c.name,
+            c.account_name,
+            COALESCE(c.customer_type, 'Residential') AS customer_type,
+            c.address,
+            c.street_address,
+            c.city,
+            c.state,
+            c.zip,
+            c.phone,
+            c.email,
+            c.text_phone,
+            c.square_feet,
+            c.turf_type,
+            c.special_instructions,
+            c.lat,
+            c.lng,
+            c.neighborhood,
+            c.service,
+            COALESCE(NULLIF(dj.treatment_name, ''), c.service) AS service_name
+        FROM dispatch_jobs dj
+        INNER JOIN customers c
+            ON c.id=dj.customer_id
+        WHERE LOWER(COALESCE(dj.status, ''))='queued'
+          AND COALESCE(c.active, 1)=1
+    """
+    params: list[Any] = []
+
+    if customer_type not in (None, "", "All"):
+        sql += " AND COALESCE(c.customer_type, 'Residential')=?"
+        params.append(customer_type)
+
+    sql += """
+        ORDER BY
+            CASE WHEN dj.scheduled_date IS NULL OR dj.scheduled_date='' THEN 1 ELSE 0 END,
+            dj.scheduled_date,
+            c.name
+    """
+    return dataframe(sql, tuple(params))
+
+
+# -----------------------------
+# Crew management
+# -----------------------------
+
+def create_crew(
+    crew_name: str,
+    email: str | None = None,
+    phone: str | None = None,
+    notes: str | None = None,
+    active: bool = True,
+) -> int:
+    if not crew_name or not str(crew_name).strip():
+        raise ValueError("Crew name is required.")
+
+    return execute(
+        """
+        INSERT INTO crews (
+            crew_name, email, phone, active, notes
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            str(crew_name).strip(),
+            email,
+            phone,
+            int(bool(active)),
+            notes,
+        ),
+    )
+
+
+def get_crews(
+    active_only: bool = True,
+) -> pd.DataFrame:
+    sql = "SELECT * FROM crews"
+    if active_only:
+        sql += " WHERE active=1"
+    sql += " ORDER BY crew_name"
+    return dataframe(sql)
+
+
+def update_crew(
+    crew_id: int,
+    **kwargs,
+):
+    allowed = {
+        "crew_name",
+        "email",
+        "phone",
+        "active",
+        "notes",
+    }
+    updates = {
+        key: value
+        for key, value in kwargs.items()
+        if key in allowed
+    }
+    if not updates:
+        return
+
+    if "active" in updates:
+        updates["active"] = int(bool(updates["active"]))
+
+    fields = [f"{key}=?" for key in updates]
+    values = list(updates.values())
+    fields.append("updated=CURRENT_TIMESTAMP")
+    values.append(int(crew_id))
+
+    execute(
+        f"UPDATE crews SET {', '.join(fields)} WHERE id=?",
+        tuple(values),
+    )
+
+
+# -----------------------------
+# Persistent dispatch manifests
+# -----------------------------
+
+def _new_dispatch_token() -> str:
+    import secrets
+    return secrets.token_urlsafe(24)
+
+
+def create_dispatch(
+    dispatch_date: str,
+    crew_id: int | None,
+    route_number: int | None = None,
+    status: str = "ready",
+    notes: str | None = None,
+    dispatch_token: str | None = None,
+) -> int:
+    token = dispatch_token or _new_dispatch_token()
+    return execute(
+        """
+        INSERT INTO dispatches (
+            dispatch_date,
+            crew_id,
+            route_number,
+            status,
+            dispatch_token,
+            notes
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            dispatch_date,
+            crew_id,
+            route_number,
+            status,
+            token,
+            notes,
+        ),
+    )
+
+
+def get_dispatch(
+    dispatch_id: int,
+) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                d.*,
+                c.crew_name,
+                c.email AS crew_email,
+                c.phone AS crew_phone
+            FROM dispatches d
+            LEFT JOIN crews c ON c.id=d.crew_id
+            WHERE d.id=?
+            """,
+            (int(dispatch_id),),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_dispatch_by_token(
+    dispatch_token: str,
+) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                d.*,
+                c.crew_name,
+                c.email AS crew_email,
+                c.phone AS crew_phone
+            FROM dispatches d
+            LEFT JOIN crews c ON c.id=d.crew_id
+            WHERE d.dispatch_token=?
+            """,
+            (dispatch_token,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_dispatches(
+    dispatch_date: str | None = None,
+) -> pd.DataFrame:
+    sql = """
+        SELECT
+            d.*,
+            c.crew_name,
+            c.email AS crew_email,
+            c.phone AS crew_phone,
+            COUNT(dj.id) AS stop_count,
+            SUM(
+                CASE WHEN LOWER(COALESCE(dj.status,''))='completed'
+                     THEN 1 ELSE 0 END
+            ) AS completed_count
+        FROM dispatches d
+        LEFT JOIN crews c ON c.id=d.crew_id
+        LEFT JOIN dispatch_jobs dj ON dj.dispatch_id=d.id
+    """
+    params: list[Any] = []
+    if dispatch_date:
+        sql += " WHERE d.dispatch_date=?"
+        params.append(dispatch_date)
+    sql += """
+        GROUP BY d.id, c.crew_name, c.email, c.phone
+        ORDER BY d.dispatch_date DESC,
+                 COALESCE(d.route_number, 9999),
+                 c.crew_name
+    """
+    return dataframe(sql, tuple(params))
+
+
+def assign_job_to_dispatch(
+    job_id: int,
+    dispatch_id: int,
+    crew_id: int | None,
+    route_number: int,
+    stop_number: int,
+):
+    execute(
+        """
+        UPDATE dispatch_jobs
+        SET
+            dispatch_id=?,
+            crew_id=?,
+            route_number=?,
+            stop_number=?,
+            status='dispatched'
+        WHERE id=?
+        """,
+        (
+            int(dispatch_id),
+            crew_id,
+            int(route_number),
+            int(stop_number),
+            int(job_id),
+        ),
+    )
+
+
+def get_dispatch_jobs_for_manifest(
+    dispatch_id: int,
+) -> pd.DataFrame:
+    return dataframe(
+        """
+        SELECT
+            dj.*,
+            c.customer_number,
+            c.name,
+            c.account_name,
+            COALESCE(c.customer_type, 'Residential') AS customer_type,
+            c.address,
+            c.street_address,
+            c.city,
+            c.state,
+            c.zip,
+            c.phone,
+            c.email,
+            c.text_phone,
+            c.square_feet,
+            c.special_instructions,
+            c.lat,
+            c.lng,
+            c.service,
+            d.dispatch_date,
+            d.dispatch_token,
+            d.status AS dispatch_status,
+            cr.crew_name
+        FROM dispatch_jobs dj
+        INNER JOIN customers c ON c.id=dj.customer_id
+        INNER JOIN dispatches d ON d.id=dj.dispatch_id
+        LEFT JOIN crews cr ON cr.id=dj.crew_id
+        WHERE dj.dispatch_id=?
+        ORDER BY dj.stop_number, dj.id
+        """,
+        (int(dispatch_id),),
+    )
+
+
+def mark_dispatch_sent(
+    dispatch_id: int,
+):
+    execute(
+        """
+        UPDATE dispatches
+        SET status='sent',
+            sent_at=CURRENT_TIMESTAMP,
+            updated=CURRENT_TIMESTAMP
+        WHERE id=?
+        """,
+        (int(dispatch_id),),
+    )
+
+
+def mark_job_arrived(
+    job_id: int,
+):
+    execute(
+        """
+        UPDATE dispatch_jobs
+        SET status='in_progress',
+            arrived_time=CURRENT_TIMESTAMP
+        WHERE id=?
+        """,
+        (int(job_id),),
+    )
+
+    execute(
+        """
+        UPDATE dispatches
+        SET status='in_progress',
+            started_at=COALESCE(started_at, CURRENT_TIMESTAMP),
+            updated=CURRENT_TIMESTAMP
+        WHERE id=(
+            SELECT dispatch_id
+            FROM dispatch_jobs
+            WHERE id=?
+        )
+        """,
+        (int(job_id),),
+    )
+
+
+def mark_job_completed(
+    job_id: int,
+):
+    execute(
+        """
+        UPDATE dispatch_jobs
+        SET status='completed',
+            completed_time=CURRENT_TIMESTAMP
+        WHERE id=?
+        """,
+        (int(job_id),),
+    )
+
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT dispatch_id FROM dispatch_jobs WHERE id=?",
+            (int(job_id),),
+        ).fetchone()
+
+        dispatch_id = row[0] if row else None
+
+        if dispatch_id is not None:
+            remaining = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM dispatch_jobs
+                WHERE dispatch_id=?
+                  AND LOWER(COALESCE(status,'')) NOT IN (
+                      'completed', 'cancelled', 'canceled'
+                  )
+                """,
+                (int(dispatch_id),),
+            ).fetchone()[0]
+
+            if int(remaining) == 0:
+                conn.execute(
+                    """
+                    UPDATE dispatches
+                    SET status='completed',
+                        completed_at=CURRENT_TIMESTAMP,
+                        updated=CURRENT_TIMESTAMP
+                    WHERE id=?
+                    """,
+                    (int(dispatch_id),),
+                )
+                conn.commit()
+    finally:
+        conn.close()
+
+
+def queue_dispatch_job(
+    job_id: int,
+):
+    execute(
+        """
+        UPDATE dispatch_jobs
+        SET status='queued',
+            dispatch_id=NULL,
+            crew_id=NULL,
+            route_number=NULL,
+            stop_number=NULL,
+            arrived_time=NULL,
+            completed_time=NULL
+        WHERE id=?
+        """,
+        (int(job_id),),
+    )
+
+
+def clear_dispatch_manifest(
+    dispatch_id: int,
+    requeue_unfinished: bool = True,
+):
+    conn = get_connection()
+    try:
+        if requeue_unfinished:
+            conn.execute(
+                """
+                UPDATE dispatch_jobs
+                SET
+                    status=CASE
+                        WHEN LOWER(COALESCE(status,'')) IN (
+                            'completed','cancelled','canceled'
+                        ) THEN status
+                        ELSE 'queued'
+                    END,
+                    dispatch_id=NULL,
+                    crew_id=NULL,
+                    route_number=NULL,
+                    stop_number=NULL,
+                    arrived_time=CASE
+                        WHEN LOWER(COALESCE(status,''))='completed'
+                        THEN arrived_time ELSE NULL END,
+                    completed_time=CASE
+                        WHEN LOWER(COALESCE(status,''))='completed'
+                        THEN completed_time ELSE NULL END
+                WHERE dispatch_id=?
+                """,
+                (int(dispatch_id),),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE dispatch_jobs
+                SET dispatch_id=NULL,
+                    crew_id=NULL,
+                    route_number=NULL,
+                    stop_number=NULL
+                WHERE dispatch_id=?
+                """,
+                (int(dispatch_id),),
+            )
+
+        conn.execute(
+            "DELETE FROM dispatches WHERE id=?",
+            (int(dispatch_id),),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# -----------------------------
+# Persistent table preferences
+# -----------------------------
+
+def save_table_preferences(
+    table_name: str,
+    column_order=None,
+    hidden_columns=None,
+    sort_state=None,
+):
+    import json
+    execute(
+        """
+        INSERT INTO table_preferences (
+            table_name,
+            column_order_json,
+            hidden_columns_json,
+            sort_json,
+            updated
+        )
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(table_name)
+        DO UPDATE SET
+            column_order_json=excluded.column_order_json,
+            hidden_columns_json=excluded.hidden_columns_json,
+            sort_json=excluded.sort_json,
+            updated=CURRENT_TIMESTAMP
+        """,
+        (
+            table_name,
+            json.dumps(list(column_order or [])),
+            json.dumps(list(hidden_columns or [])),
+            json.dumps(sort_state or {}),
+        ),
+    )
+
+
+def get_table_preferences(
+    table_name: str,
+) -> Dict[str, Any]:
+    import json
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                column_order_json,
+                hidden_columns_json,
+                sort_json
+            FROM table_preferences
+            WHERE table_name=?
+            """,
+            (table_name,),
+        ).fetchone()
+
+        if row is None:
+            return {
+                "column_order": [],
+                "hidden_columns": [],
+                "sort": {},
+            }
+
+        def load(value, fallback):
+            if value in (None, ""):
+                return fallback
+            try:
+                return json.loads(value)
+            except Exception:
+                return fallback
+
+        return {
+            "column_order": load(row[0], []),
+            "hidden_columns": load(row[1], []),
+            "sort": load(row[2], {}),
+        }
+    finally:
+        conn.close()
+
+
+# Apply CRM v3 schema upgrades after the legacy schema has been initialized.
+init_extended_schema()

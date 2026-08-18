@@ -1,763 +1,846 @@
+"""
+services/geocoding.py
 
-# Time Out Lawncare CRM
-# Geocoding Services
+Geocoding service for Time Out Lawncare CRM.
 
-# Version 2.0
+Compatibility goals:
+- Preserve legacy clean_address() and geocode() callers.
+- Support newer geocode_address() callers that expect a dictionary.
+- Provide bulk geocoding through geocode_customers().
+- Use Google Geocoding API.
+- Cache successful geocodes when the database cache helpers are available.
+- Return clean failure values instead of crashing the Streamlit application.
 
+Coordinate conventions:
+- Legacy geocode() returns: (lat, lng)
+- geocode_address() returns: {"lat": float, "lng": float, ...}
+- Database customer records may store longitude in a column named "lon".
+"""
 
 from __future__ import annotations
 
 import os
+import re
 import time
-import logging
-from math import radians, sin, cos, sqrt, atan2
-from typing import Dict, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
+from urllib.parse import quote
 
-import pandas as pd
 import requests
-import streamlit as st
 
-from geopy.exc import (
-    GeocoderTimedOut,
-    GeocoderUnavailable,
-    GeocoderServiceError,
-)
 
-from geopy.geocoders import Nominatim
+GOOGLE_GEOCODING_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+DEFAULT_TIMEOUT_SECONDS = 10
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_DELAY_SECONDS = 1.0
 
-from data.database import (
-    dataframe,
-    execute,
-    get_customers,
-    update_customer_coordinates,
-)
+_TRANSIENT_GOOGLE_STATUSES = {
+    "UNKNOWN_ERROR",
+    "OVER_QUERY_LIMIT",
+}
 
-# --------------------------------------------------------
-# LOGGING
-# --------------------------------------------------------
+_TRANSIENT_HTTP_STATUSES = {
+    408,
+    429,
+    500,
+    502,
+    503,
+    504,
+}
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
 
-logger = logging.getLogger(__name__)
-
-# --------------------------------------------------------
-# CONFIGURATION
-# --------------------------------------------------------
-
-try:
-    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-except Exception:
-    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-
-GOOGLE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
-
-USER_AGENT = "TimeOutLawncareCRM"
-
-NOMINATIM = Nominatim(
-    user_agent=USER_AGENT,
-    timeout=10,
-)
-
-HTTP = requests.Session()
-
-MAX_RETRIES = 3
-
-RETRY_DELAY = 1.5
-
-# --------------------------------------------------------
-# CACHE TABLE
-# --------------------------------------------------------
-
-execute(
+def clean_address(address: Any) -> str:
     """
-    CREATE TABLE IF NOT EXISTS geocode_cache
-    (
-        address TEXT PRIMARY KEY,
+    Normalize an address for geocoding.
 
-        lat REAL,
-
-        lng REAL,
-
-        formatted_address TEXT,
-
-        provider TEXT,
-
-        created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
+    The function intentionally performs conservative cleanup only. It does not
+    rewrite street names or abbreviations because doing so can make valid
+    addresses less accurate.
     """
-)
-
-# --------------------------------------------------------
-# ADDRESS NORMALIZATION
-# --------------------------------------------------------
-
-def normalize_address(address: str) -> str:
-
     if address is None:
         return ""
 
-    address = address.upper().strip()
+    text = str(address).strip()
+    if not text:
+        return ""
 
-    replacements = {
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s*,\s*", ", ", text)
+    text = re.sub(r",\s*,+", ", ", text)
+    text = text.strip(" ,")
 
-        ".": "",
-
-        ",": "",
-
-        " ROAD": " RD",
-
-        " STREET": " ST",
-
-        " AVENUE": " AVE",
-
-        " DRIVE": " DR",
-
-        " BOULEVARD": " BLVD",
-
-        " LANE": " LN",
-
-        " HIGHWAY": " HWY",
-
-        " CIRCLE": " CIR",
-
-        " COURT": " CT",
-
-        " PLACE": " PL",
-
-        " PARKWAY": " PKWY",
-
-    }
-
-    for old, new in replacements.items():
-
-        address = address.replace(old, new)
-
-    return " ".join(address.split())
-
-# --------------------------------------------------------
-# CACHE
-# --------------------------------------------------------
-
-def cache_lookup(address: str) -> Optional[Dict]:
-
-    df = dataframe(
-        """
-        SELECT *
-
-        FROM geocode_cache
-
-        WHERE address=?
-        """,
-        (normalize_address(address),),
-    )
-
-    if df.empty:
-        return None
-
-    row = df.iloc[0]
-
-    return {
-
-        "lat": row["lat"],
-
-        "lng": row["lng"],
-
-        "address": row["formatted_address"],
-
-        "provider": row["provider"],
-
-    }
+    return text
 
 
-def cache_save(
-    address: str,
-    lat: float,
-    lng: float,
-    formatted_address: str,
-    provider: str,
-):
+def address_cache_key(address: Any) -> str:
+    """Return a stable normalized cache key for an address."""
+    return clean_address(address).casefold()
 
-    execute(
-        """
-        INSERT INTO geocode_cache
-        (
-            address,
-            lat,
-            lng,
-            formatted_address,
-            provider
-        )
 
-        VALUES
-        (
-            ?,?,?,?,?
-        )
+def build_full_address(
+    street_address: Any = None,
+    city: Any = None,
+    state: Any = None,
+    zip_code: Any = None,
+) -> str:
+    """
+    Build a geocodable address from separate customer fields.
 
-        ON CONFLICT(address)
+    Empty components are omitted.
+    """
+    street = clean_address(street_address)
+    city_text = clean_address(city)
+    state_text = clean_address(state)
+    zip_text = clean_address(zip_code)
 
-        DO UPDATE
+    locality_parts = [part for part in (city_text, state_text) if part]
+    locality = ", ".join(locality_parts)
 
-        SET
+    if zip_text:
+        locality = f"{locality} {zip_text}".strip()
 
-            lat=excluded.lat,
+    pieces = [part for part in (street, locality) if part]
+    return ", ".join(pieces)
 
-            lng=excluded.lng,
 
-            formatted_address=excluded.formatted_address,
+def _read_streamlit_secret(name: str) -> Optional[str]:
+    """
+    Read a Streamlit secret without making Streamlit a hard dependency.
 
-            provider=excluded.provider
-        """,
-        (
-            normalize_address(address),
-            lat,
-            lng,
-            formatted_address,
-            provider,
-        ),
-    )
-
-# --------------------------------------------------------
-# VALIDATION
-# --------------------------------------------------------
-
-def valid_coordinates(
-    lat: float | None,
-    lng: float | None,
-) -> bool:
-
-    if lat is None:
-        return False
-
-    if lng is None:
-        return False
-
-    return (
-        -90 <= lat <= 90
-        and
-        -180 <= lng <= 180
-    )
-
-# --------------------------------------------------------
-# GOOGLE GEOCODING
-# --------------------------------------------------------
-
-def google_geocode(
-    address: str,
-) -> Optional[Dict]:
-
-    if not GOOGLE_API_KEY:
-        return None
-
-    params = {
-
-        "address": address,
-
-        "key": GOOGLE_API_KEY,
-
-    }
-
-    for attempt in range(MAX_RETRIES):
+    This keeps geocoding usable from scripts, tests, and import utilities.
+    """
+    try:
+        import streamlit as st  # type: ignore
 
         try:
+            value = st.secrets.get(name)
+        except Exception:
+            value = None
 
-            response = HTTP.get(
-                GOOGLE_URL,
-                params=params,
-                timeout=10,
-            )
-
-            response.raise_for_status()
-
-            payload = response.json()
-
-            if payload["status"] != "OK":
-
-                logger.warning(
-                    "Google returned %s",
-                    payload["status"],
-                )
-
-                return None
-
-            result = payload["results"][0]
-
-            location = result["geometry"]["location"]
-
-            return {
-
-                "lat": location["lat"],
-
-                "lng": location["lng"],
-
-                "address": result["formatted_address"],
-
-                "provider": "Google",
-
-            }
-
-        except Exception as ex:
-
-            logger.warning(ex)
-
-            if attempt == MAX_RETRIES - 1:
-                return None
-
-            time.sleep(RETRY_DELAY)
+        if value is not None:
+            value = str(value).strip()
+            if value:
+                return value
+    except Exception:
+        pass
 
     return None
 
-# --------------------------------------------------------
-# NOMINATIM FALLBACK
-# --------------------------------------------------------
 
-def nominatim_geocode(
+def get_google_api_key(explicit_key: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve the Google API key.
+
+    Resolution order:
+    1. Explicit argument
+    2. Streamlit secret GOOGLE_API_KEY
+    3. Environment variable GOOGLE_API_KEY
+    4. Environment variable GOOGLE_MAPS_API_KEY
+    """
+    if explicit_key:
+        key = str(explicit_key).strip()
+        if key:
+            return key
+
+    key = _read_streamlit_secret("GOOGLE_API_KEY")
+    if key:
+        return key
+
+    for env_name in ("GOOGLE_API_KEY", "GOOGLE_MAPS_API_KEY"):
+        value = os.getenv(env_name)
+        if value:
+            value = value.strip()
+            if value:
+                return value
+
+    return None
+
+
+def _cache_lookup(
     address: str,
-) -> Optional[Dict]:
+    database: Any = None,
+) -> Optional[tuple[float, float]]:
+    """
+    Look up an address in the database geocode cache when supported.
 
-    for attempt in range(MAX_RETRIES):
+    Multiple compatibility surfaces are supported so this module can coexist
+    with both the current and refactored database layers.
+    """
+    if database is None:
+        return None
+
+    key = address_cache_key(address)
+
+    # New Database-service style.
+    method = getattr(database, "get_cached_geocode", None)
+    if callable(method):
+        try:
+            cached = method(key)
+            if cached:
+                if isinstance(cached, Mapping):
+                    lat = cached.get("lat")
+                    lon = cached.get("lon", cached.get("lng"))
+                else:
+                    lat, lon = cached[0], cached[1]
+
+                if lat is not None and lon is not None:
+                    return float(lat), float(lon)
+        except Exception:
+            pass
+
+    # Compatibility with module-level or alternate cache methods.
+    for method_name in (
+        "lookup_geocode_cache",
+        "get_geocode_cache",
+        "load_geocode_cache",
+    ):
+        method = getattr(database, method_name, None)
+        if not callable(method):
+            continue
 
         try:
+            cached = method(key)
+        except TypeError:
+            try:
+                cached = method(address)
+            except Exception:
+                continue
+        except Exception:
+            continue
 
-            location = NOMINATIM.geocode(address)
+        if not cached:
+            continue
 
-            if location is None:
+        try:
+            if isinstance(cached, Mapping):
+                lat = cached.get("lat")
+                lon = cached.get("lon", cached.get("lng"))
+            else:
+                lat, lon = cached[0], cached[1]
 
-                return None
+            if lat is not None and lon is not None:
+                return float(lat), float(lon)
+        except (TypeError, ValueError, IndexError):
+            continue
 
+    return None
+
+
+def _cache_save(
+    address: str,
+    lat: float,
+    lng: float,
+    database: Any = None,
+    source: str = "google",
+) -> None:
+    """Save a successful geocode when the database supports caching."""
+    if database is None:
+        return
+
+    key = address_cache_key(address)
+
+    method = getattr(database, "save_geocode", None)
+    if callable(method):
+        try:
+            method(
+                address_key=key,
+                original_address=address,
+                lat=lat,
+                lon=lng,
+                source=source,
+            )
+            return
+        except TypeError:
+            try:
+                method(key, address, lat, lng, source)
+                return
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    for method_name in (
+        "save_geocode_cache",
+        "set_geocode_cache",
+        "upsert_geocode_cache",
+    ):
+        method = getattr(database, method_name, None)
+        if not callable(method):
+            continue
+
+        attempts = (
+            lambda: method(
+                address_key=key,
+                address=address,
+                lat=lat,
+                lon=lng,
+                source=source,
+            ),
+            lambda: method(address, lat, lng),
+            lambda: method(key, lat, lng),
+        )
+
+        for attempt in attempts:
+            try:
+                attempt()
+                return
+            except TypeError:
+                continue
+            except Exception:
+                break
+
+
+def _google_request(
+    address: str,
+    api_key: str,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> requests.Response:
+    """
+    Perform one Google Geocoding API request.
+
+    Params are passed separately so requests handles URL encoding correctly.
+    """
+    return requests.get(
+        GOOGLE_GEOCODING_URL,
+        params={
+            "address": address,
+            "key": api_key,
+        },
+        timeout=timeout,
+    )
+
+
+def _parse_google_result(
+    payload: Mapping[str, Any],
+    requested_address: str,
+) -> Optional[dict[str, Any]]:
+    """Parse the first valid result from a Google Geocoding response."""
+    if payload.get("status") != "OK":
+        return None
+
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        return None
+
+    first = results[0]
+    if not isinstance(first, Mapping):
+        return None
+
+    geometry = first.get("geometry")
+    if not isinstance(geometry, Mapping):
+        return None
+
+    location = geometry.get("location")
+    if not isinstance(location, Mapping):
+        return None
+
+    lat = location.get("lat")
+    lng = location.get("lng")
+
+    if lat is None or lng is None:
+        return None
+
+    try:
+        lat_value = float(lat)
+        lng_value = float(lng)
+    except (TypeError, ValueError):
+        return None
+
+    return {
+        "lat": lat_value,
+        "lng": lng_value,
+        "lon": lng_value,
+        "formatted_address": first.get(
+            "formatted_address",
+            requested_address,
+        ),
+        "place_id": first.get("place_id"),
+        "location_type": geometry.get("location_type"),
+        "partial_match": bool(first.get("partial_match", False)),
+        "source": "google",
+        "status": "OK",
+        "requested_address": requested_address,
+    }
+
+
+def geocode_address(
+    address: Any,
+    google_api_key: Optional[str] = None,
+    *,
+    database: Any = None,
+    use_cache: bool = True,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_delay: float = DEFAULT_RETRY_DELAY_SECONDS,
+) -> Optional[dict[str, Any]]:
+    """
+    Geocode an address and return a structured result.
+
+    Success:
+        {
+            "lat": 32.123,
+            "lng": -89.456,
+            "lon": -89.456,
+            "formatted_address": "...",
+            "source": "google" or "cache",
+            ...
+        }
+
+    Failure:
+        None
+
+    The function does not raise for ordinary geocoding failures. That behavior
+    is intentional so a bad customer address cannot blank a Streamlit tab.
+    """
+    cleaned = clean_address(address)
+    if not cleaned:
+        return None
+
+    if use_cache:
+        cached = _cache_lookup(cleaned, database)
+        if cached:
+            lat, lng = cached
             return {
-
-                "lat": location.latitude,
-
-                "lng": location.longitude,
-
-                "address": location.address,
-
-                "provider": "Nominatim",
-
+                "lat": lat,
+                "lng": lng,
+                "lon": lng,
+                "formatted_address": cleaned,
+                "place_id": None,
+                "location_type": None,
+                "partial_match": False,
+                "source": "cache",
+                "status": "OK",
+                "requested_address": cleaned,
             }
 
-        except (
-            GeocoderTimedOut,
-            GeocoderUnavailable,
-            GeocoderServiceError,
-        ):
+    api_key = get_google_api_key(google_api_key)
+    if not api_key:
+        return None
 
-            if attempt == MAX_RETRIES - 1:
+    attempts = max(1, int(max_retries))
+
+    for attempt_number in range(1, attempts + 1):
+        try:
+            response = _google_request(
+                cleaned,
+                api_key,
+                timeout=timeout,
+            )
+
+            if response.status_code in _TRANSIENT_HTTP_STATUSES:
+                if attempt_number < attempts:
+                    time.sleep(retry_delay * attempt_number)
+                    continue
                 return None
 
-            time.sleep(RETRY_DELAY)
+            response.raise_for_status()
+            payload = response.json()
 
-        except Exception:
+            if not isinstance(payload, Mapping):
+                return None
 
+            status = str(payload.get("status", "")).upper()
+
+            if status in _TRANSIENT_GOOGLE_STATUSES:
+                if attempt_number < attempts:
+                    time.sleep(retry_delay * attempt_number)
+                    continue
+                return None
+
+            result = _parse_google_result(payload, cleaned)
+            if result is None:
+                return None
+
+            if use_cache:
+                _cache_save(
+                    cleaned,
+                    result["lat"],
+                    result["lng"],
+                    database,
+                    source="google",
+                )
+
+            return result
+
+        except (
+            requests.Timeout,
+            requests.ConnectionError,
+        ):
+            if attempt_number < attempts:
+                time.sleep(retry_delay * attempt_number)
+                continue
+            return None
+
+        except (
+            requests.RequestException,
+            ValueError,
+            TypeError,
+        ):
             return None
 
     return None
 
-# --------------------------------------------------------
-# MASTER GEOCODER
-# --------------------------------------------------------
 
-def geocode_address(
-    address: str,
-    force_refresh: bool = False,
-) -> Optional[Dict]:
+def geocode(
+    address: Any,
+    google_api_key: Optional[str] = None,
+    *,
+    database: Any = None,
+    use_cache: bool = True,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_delay: float = DEFAULT_RETRY_DELAY_SECONDS,
+) -> tuple[Optional[float], Optional[float]]:
+    """
+    Legacy-compatible geocoder.
 
-    if not address:
-        return None
+    Returns:
+        (lat, lng)
 
-    if not force_refresh:
+    Failure:
+        (None, None)
 
-        cached = cache_lookup(address)
+    The google_api_key argument is optional so both historical call patterns
+    remain valid:
 
-        if cached:
-
-            return cached
-
-    result = google_geocode(address)
-
-    if result is None:
-
-        logger.info("Google failed, using Nominatim...")
-
-        result = nominatim_geocode(address)
-
-    if result is None:
-
-        return None
-
-    cache_save(
+        geocode(address)
+        geocode(address, GOOGLE_API_KEY)
+    """
+    result = geocode_address(
         address,
-        result["lat"],
-        result["lng"],
-        result["address"],
-        result["provider"],
+        google_api_key,
+        database=database,
+        use_cache=use_cache,
+        timeout=timeout,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
     )
 
-    return result
-    
-# --------------------------------------------------------
-# BATCH GEOCODING
-# --------------------------------------------------------
+    if not result:
+        return None, None
+
+    return result["lat"], result["lng"]
+
+
+def geocode_customer(
+    customer: Mapping[str, Any],
+    google_api_key: Optional[str] = None,
+    *,
+    database: Any = None,
+    use_cache: bool = True,
+) -> Optional[dict[str, Any]]:
+    """
+    Geocode one customer mapping.
+
+    Recognized address fields:
+    - address
+    - street_address
+    - city
+    - state
+    - zip
+    - zip_code
+    """
+    street = customer.get("address") or customer.get("street_address")
+    city = customer.get("city")
+    state = customer.get("state")
+    zip_code = customer.get("zip") or customer.get("zip_code")
+
+    full_address = build_full_address(
+        street,
+        city,
+        state,
+        zip_code,
+    )
+
+    if not full_address:
+        return None
+
+    return geocode_address(
+        full_address,
+        google_api_key,
+        database=database,
+        use_cache=use_cache,
+    )
+
+
+def _customer_needs_geocode(customer: Mapping[str, Any]) -> bool:
+    lat = customer.get("lat")
+    lon = customer.get("lon", customer.get("lng"))
+
+    if lat is None or lon is None:
+        return True
+
+    try:
+        float(lat)
+        float(lon)
+        return False
+    except (TypeError, ValueError):
+        return True
+
+
+def _update_customer_coordinates(
+    customer: Mapping[str, Any],
+    lat: float,
+    lng: float,
+    database: Any = None,
+    update_callback: Optional[
+        Callable[[Any, float, float], Any]
+    ] = None,
+) -> bool:
+    """
+    Persist coordinates using a callback or compatible database method.
+    """
+    customer_id = customer.get("id") or customer.get("customer_id")
+
+    if customer_id is None:
+        return False
+
+    if update_callback is not None:
+        try:
+            update_callback(customer_id, lat, lng)
+            return True
+        except Exception:
+            return False
+
+    if database is None:
+        return False
+
+    method = getattr(database, "update_customer", None)
+    if callable(method):
+        attempts = (
+            lambda: method(customer_id, lat=lat, lon=lng),
+            lambda: method(customer_id, lat=lat, lng=lng),
+            lambda: method(
+                customer_id=customer_id,
+                lat=lat,
+                lon=lng,
+            ),
+        )
+
+        for attempt in attempts:
+            try:
+                attempt()
+                return True
+            except TypeError:
+                continue
+            except Exception:
+                return False
+
+    for method_name in (
+        "update_customer_coordinates",
+        "save_customer_coordinates",
+    ):
+        method = getattr(database, method_name, None)
+        if not callable(method):
+            continue
+
+        attempts = (
+            lambda: method(customer_id, lat, lng),
+            lambda: method(
+                customer_id=customer_id,
+                lat=lat,
+                lon=lng,
+            ),
+            lambda: method(
+                customer_id=customer_id,
+                lat=lat,
+                lng=lng,
+            ),
+        )
+
+        for attempt in attempts:
+            try:
+                attempt()
+                return True
+            except TypeError:
+                continue
+            except Exception:
+                return False
+
+    return False
+
 
 def geocode_customers(
-    update_existing: bool = False,
-) -> pd.DataFrame:
+    customers: Iterable[Mapping[str, Any]],
+    google_api_key: Optional[str] = None,
+    *,
+    database: Any = None,
+    only_missing: bool = True,
+    use_cache: bool = True,
+    update_callback: Optional[
+        Callable[[Any, float, float], Any]
+    ] = None,
+    progress_callback: Optional[
+        Callable[[int, int, Mapping[str, Any], str], Any]
+    ] = None,
+    delay_between_requests: float = 0.05,
+) -> dict[str, Any]:
     """
-    Geocodes every customer.
+    Bulk geocode customers.
 
-    Parameters
-    ----------
-    update_existing
-        False = only customers missing coordinates.
-        True = re-geocode every customer.
+    This function does not depend on Streamlit UI components. A tab can pass
+    callbacks for persistence and progress reporting.
+
+    Returns a summary dictionary containing counts and failed customers.
     """
+    customer_list = list(customers)
+    total = len(customer_list)
 
-    customers = get_customers()
+    summary: dict[str, Any] = {
+        "total": total,
+        "attempted": 0,
+        "updated": 0,
+        "skipped": 0,
+        "failed": 0,
+        "failures": [],
+    }
 
-    if customers.empty:
-        return customers
+    for index, customer in enumerate(customer_list, start=1):
+        customer_name = (
+            customer.get("customer_name")
+            or customer.get("name")
+            or f"Customer {customer.get('id', index)}"
+        )
 
-    total = len(customers)
-
-    updated = 0
-
-    for _, customer in customers.iterrows():
-
-        lat = customer.get("lat")
-        lng = customer.get("lng")
-
-        if (
-            not update_existing
-            and valid_coordinates(lat, lng)
-        ):
+        if only_missing and not _customer_needs_geocode(customer):
+            summary["skipped"] += 1
+            if progress_callback:
+                progress_callback(
+                    index,
+                    total,
+                    customer,
+                    "skipped",
+                )
             continue
 
-        result = geocode_address(customer["address"])
+        summary["attempted"] += 1
 
-        if result is None:
+        result = geocode_customer(
+            customer,
+            google_api_key,
+            database=database,
+            use_cache=use_cache,
+        )
+
+        if not result:
+            summary["failed"] += 1
+            summary["failures"].append(
+                {
+                    "customer_id": customer.get("id")
+                    or customer.get("customer_id"),
+                    "customer_name": customer_name,
+                    "reason": "Address could not be geocoded",
+                }
+            )
+
+            if progress_callback:
+                progress_callback(
+                    index,
+                    total,
+                    customer,
+                    "failed",
+                )
             continue
 
-        update_customer_coordinates(
-            customer["id"],
+        persisted = _update_customer_coordinates(
+            customer,
             result["lat"],
             result["lng"],
+            database=database,
+            update_callback=update_callback,
         )
 
-        updated += 1
-
-        #
-        # Be nice to Nominatim if we fall back.
-        #
-        if result["provider"] == "Nominatim":
-            time.sleep(1)
-
-    logger.info(
-        "Updated %s of %s customers",
-        updated,
-        total,
-    )
-
-    return get_customers()
-
-
-# --------------------------------------------------------
-# MISSING COORDINATES
-# --------------------------------------------------------
-
-def customers_missing_coordinates() -> pd.DataFrame:
-
-    customers = get_customers()
-
-    if customers.empty:
-        return customers
-
-    return customers[
-        customers["lat"].isna()
-        |
-        customers["lng"].isna()
-    ].copy()
-
-
-# --------------------------------------------------------
-# DISTANCE (HAVERSINE)
-# --------------------------------------------------------
-
-def distance_between(
-    lat1: float,
-    lng1: float,
-    lat2: float,
-    lng2: float,
-) -> float:
-    """
-    Great-circle distance in miles.
-    Accepts numeric values or numeric strings.
-    """
-    lat1 = float(lat1)
-    lng1 = float(lng1)
-    lat2 = float(lat2)
-    lng2 = float(lng2)
-
-    earth_radius = 3958.756
-
-    dlat = radians(lat2 - lat1)
-    dlng = radians(lng2 - lng1)
-
-    a = (
-        sin(dlat / 2) ** 2
-        + cos(radians(lat1))
-        * cos(radians(lat2))
-        * sin(dlng / 2) ** 2
-    )
-
-    c = 2 * atan2(
-        sqrt(a),
-        sqrt(1 - a),
-    )
-
-    return earth_radius * c
-
-
-# --------------------------------------------------------
-# NEAREST CUSTOMER
-# --------------------------------------------------------
-
-def nearest_customer(
-    latitude: float,
-    longitude: float,
-) -> Optional[Dict]:
-
-    customers = get_customers()
-
-    if customers.empty:
-        return None
-
-    winner = None
-
-    winner_distance = None
-
-    for _, customer in customers.iterrows():
-
-        lat = customer["lat"]
-        lng = customer["lng"]
-
-        if not valid_coordinates(lat, lng):
-            continue
-
-        miles = distance_between(
-            latitude,
-            longitude,
-            lat,
-            lng,
-        )
-
-        if (
-            winner_distance is None
-            or
-            miles < winner_distance
-        ):
-            winner_distance = miles
-            winner = customer.to_dict()
-
-    if winner is None:
-        return None
-
-    winner["distance"] = round(
-        winner_distance,
-        2,
-    )
-
-    return winner
-
-
-# --------------------------------------------------------
-# CACHE UTILITIES
-# --------------------------------------------------------
-
-def cache_size() -> int:
-
-    df = dataframe(
-        """
-        SELECT COUNT(*) AS total
-
-        FROM geocode_cache
-        """
-    )
-
-    return int(df.iloc[0]["total"])
-
-
-def cache_contents() -> pd.DataFrame:
-
-    return dataframe(
-        """
-        SELECT *
-
-        FROM geocode_cache
-
-        ORDER BY created DESC
-        """
-    )
-
-
-def clear_cache():
-
-    execute(
-        """
-        DELETE
-
-        FROM geocode_cache
-        """
-    )
-
-
-def remove_cached_address(
-    address: str,
-):
-
-    execute(
-        """
-        DELETE
-
-        FROM geocode_cache
-
-        WHERE address=?
-        """,
-        (
-            normalize_address(address),
-        ),
-    )
-
-
-# --------------------------------------------------------
-# CACHE REBUILD
-# --------------------------------------------------------
-
-def rebuild_cache():
-    """
-    Clears cache then rebuilds it from Google.
-    """
-
-    clear_cache()
-
-    geocode_customers(
-        update_existing=True,
-    )
-
-
-# --------------------------------------------------------
-# PROVIDER TEST
-# --------------------------------------------------------
-
-def provider_available() -> Dict[str, bool]:
-
-    return {
-
-        "google": bool(GOOGLE_API_KEY),
-
-        "nominatim": True,
-
-    }
-
-
-# --------------------------------------------------------
-# HEALTH
-# --------------------------------------------------------
-
-def geocoder_health() -> Dict:
-
-    customers = get_customers()
-
-    if customers.empty:
-
-        total = 0
-
-        geocoded = 0
-
-    else:
-
-        total = len(customers)
-
-        geocoded = len(
-            customers.dropna(
-                subset=[
-                    "lat",
-                    "lng",
-                ]
+        if database is None and update_callback is None:
+            # Geocoding succeeded even though the caller did not request DB
+            # persistence. Count it as updated for bulk-operation reporting.
+            persisted = True
+
+        if persisted:
+            summary["updated"] += 1
+            status = "updated"
+        else:
+            summary["failed"] += 1
+            status = "failed"
+            summary["failures"].append(
+                {
+                    "customer_id": customer.get("id")
+                    or customer.get("customer_id"),
+                    "customer_name": customer_name,
+                    "reason": (
+                        "Geocoded successfully but coordinates "
+                        "could not be persisted"
+                    ),
+                }
             )
-        )
 
-    providers = dataframe(
-        """
-        SELECT
-            provider,
-            COUNT(*) total
+        if progress_callback:
+            progress_callback(
+                index,
+                total,
+                customer,
+                status,
+            )
 
-        FROM geocode_cache
+        if delay_between_requests > 0 and index < total:
+            time.sleep(delay_between_requests)
 
-        GROUP BY provider
-        """
+    return summary
+
+
+def geocode_customer_address(
+    address: Any,
+    city: Any = None,
+    state: Any = None,
+    zip_code: Any = None,
+    google_api_key: Optional[str] = None,
+    *,
+    database: Any = None,
+) -> tuple[Optional[float], Optional[float]]:
+    """
+    Convenience wrapper for callers with separate address fields.
+
+    Returns a legacy-compatible (lat, lng) tuple.
+    """
+    full_address = build_full_address(
+        address,
+        city,
+        state,
+        zip_code,
     )
 
-    provider_counts = {}
-
-    if not providers.empty:
-
-        for _, row in providers.iterrows():
-
-            provider_counts[
-                row["provider"]
-            ] = int(row["total"])
-
-    return {
-
-        "customers": total,
-
-        "geocoded": geocoded,
-
-        "missing": total - geocoded,
-
-        "cache_entries": cache_size(),
-
-        "providers": provider_counts,
-
-        "google_enabled": bool(GOOGLE_API_KEY),
-
-    }
+    return geocode(
+        full_address,
+        google_api_key,
+        database=database,
+    )
 
 
-# --------------------------------------------------------
-# PUBLIC STATUS
-# --------------------------------------------------------
+def is_valid_coordinate(
+    lat: Any,
+    lng: Any,
+) -> bool:
+    """Return True when values form a valid latitude/longitude pair."""
+    try:
+        lat_value = float(lat)
+        lng_value = float(lng)
+    except (TypeError, ValueError):
+        return False
 
-def geocoder_status() -> str:
-
-    if GOOGLE_API_KEY:
-        return "Google Geocoding + Nominatim Fallback"
-
-    return "Nominatim Only"
+    return (
+        -90.0 <= lat_value <= 90.0
+        and -180.0 <= lng_value <= 180.0
+    )
 
 
-# --------------------------------------------------------
-# SELF TEST
-# --------------------------------------------------------
-
-if __name__ == "__main__":
-
-    print()
-
-    print("Geocoder Status")
-
-    print("----------------")
-
-    print(geocoder_status())
-
-    print()
-
-    print(provider_available())
-
-    print()
-
-    print(geocoder_health())
+__all__ = [
+    "GOOGLE_GEOCODING_URL",
+    "address_cache_key",
+    "build_full_address",
+    "clean_address",
+    "geocode",
+    "geocode_address",
+    "geocode_customer",
+    "geocode_customer_address",
+    "geocode_customers",
+    "get_google_api_key",
+    "is_valid_coordinate",
+]

@@ -1,39 +1,68 @@
+"""
+app.py
 
-# Time Out Lawncare CRM
+Time Out Lawncare CRM
+Main Streamlit Application
 
-# Main Streamlit Application
+This root app.py is the application entry point used locally and by
+Streamlit Cloud.
 
+Architecture:
+- core/      business logic
+- data/      Supabase/PostgreSQL data layer
+- services/  routing, geocoding, imports, learning/support services
+- tabs/      feature-specific office screens
+- ui/        Dispatch and Field Mode
+
+Business rules implemented here:
+- Customer Type keeps the Customers tab organized but does not affect routing.
+- Every job with status "queued" is Dispatch-ready regardless of scheduled_date.
+- Dispatch supports multiple crews.
+- Each persistent crew dispatch can be opened in Field Mode.
+"""
 
 from __future__ import annotations
 
 import traceback
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
-
-from core.crm import initialize_system
-from core.treatment_manager import (
-    initialize_treatment_system,
-)
-
-from datetime import date
-
-from data.database import update_customer
-
-from tabs.import_data import render as render_import_data
-
-from ui.dispatch import (
-    dispatch_dashboard,
-)
+import streamlit.components.v1 as components
 
 from core.crm import (
-    list_customers,
+    CUSTOMER_TYPES,
+    create_customer,
+    edit_customer,
+    filter_customers,
     get_dashboard_stats,
+    get_depot,
+    initialize_system,
+    list_customers,
+    update_depot,
+)
+from data.database import (
+    create_crew,
+    get_crews,
+    get_setting,
+    set_setting,
+    update_crew,
+)
+from tabs.import_data import render as render_import_data
+from ui.dispatch import (
+    build_multi_driver_routes,
+    cancel_entire_queue,
+    create_multi_crew_dispatch,
+    dispatch_dashboard,
+    get_saved_dispatches,
+    mark_job_in_progress,
 )
 
-# ---------------------------------------------------------
+
+# ==========================================================
 # PAGE CONFIG
-# ---------------------------------------------------------
+# ==========================================================
 
 st.set_page_config(
     page_title="Time Out Lawncare",
@@ -41,6 +70,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
 st.markdown(
     """
     <style>
@@ -48,78 +78,106 @@ st.markdown(
     div[data-testid="stButton"] button p {
         white-space: nowrap;
     }
+
+    div[data-testid="stMetric"] {
+        border: 1px solid rgba(49, 51, 63, 0.15);
+        border-radius: 0.5rem;
+        padding: 0.75rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-if not bool(
-    st.user.get(
-        "is_logged_in",
-        False,
-    )
-):
 
-    st.title("Time Out Lawncare CRM")
+# ==========================================================
+# AUTHENTICATION
+# ==========================================================
 
-    st.info(
-        "Sign in with an authorized Google account."
-    )
-
-    if st.button(
-        "Sign in",
-        type="primary",
+def authenticate() -> tuple[str, str]:
+    if not bool(
+        st.user.get(
+            "is_logged_in",
+            False,
+        )
     ):
-        st.login()
+        st.title(
+            "Time Out Lawncare CRM"
+        )
 
-    st.stop()
+        st.info(
+            "Sign in with an authorized Google account."
+        )
 
+        if st.button(
+            "Sign in",
+            type="primary",
+        ):
+            st.login()
 
-configured_roles = st.secrets.get(
-    "USER_ROLES",
-    {},
-)
+        st.stop()
 
-user_roles = {
-    str(email).strip().casefold():
-    str(role).strip().casefold()
-    for email, role
-    in configured_roles.items()
-}
-
-current_email = str(
-    st.user.get("email", "")
-).strip().casefold()
-
-current_role = user_roles.get(
-    current_email,
-    "",
-)
-
-valid_roles = {
-    "admin",
-    "office",
-    "field",
-}
-
-if current_role not in valid_roles:
-
-    st.error(
-        "This Google account is not authorized."
+    configured_roles = st.secrets.get(
+        "USER_ROLES",
+        {},
     )
 
-    if st.button("Sign out"):
-        st.logout()
+    user_roles = {
+        str(email)
+        .strip()
+        .casefold():
+        str(role)
+        .strip()
+        .casefold()
+        for email, role
+        in configured_roles.items()
+    }
 
-    st.stop()
+    current_email = str(
+        st.user.get(
+            "email",
+            "",
+        )
+    ).strip().casefold()
 
+    current_role = user_roles.get(
+        current_email,
+        "",
+    )
+
+    valid_roles = {
+        "admin",
+        "office",
+        "field",
+    }
+
+    if current_role not in valid_roles:
+        st.error(
+            "This Google account is not authorized."
+        )
+
+        if st.button(
+            "Sign out"
+        ):
+            st.logout()
+
+        st.stop()
+
+    return (
+        current_email,
+        current_role,
+    )
+
+
+current_email, current_role = (
+    authenticate()
+)
 
 with st.sidebar:
-
     st.write(
         f"Signed in as {current_email}"
     )
-    
+
     st.caption(
         f"Role: {current_role.title()}"
     )
@@ -130,20 +188,34 @@ with st.sidebar:
     ):
         st.logout()
 
-# ---------------------------------------------------------
-# DATABASE
-# ---------------------------------------------------------
+
+# ==========================================================
+# SYSTEM INITIALIZATION
+# ==========================================================
+
+try:
+    initialize_system()
+except Exception:
+    st.error(
+        "The CRM database could not be initialized."
+    )
+    st.exception(
+        traceback.format_exc()
+    )
+    st.stop()
+
+
+# ==========================================================
+# WORKSPACE MODE
+# ==========================================================
 
 if current_role == "field":
-
     app_mode = "Field Mode"
 
     st.sidebar.info(
         "Field access"
     )
-
 else:
-
     app_mode = st.sidebar.radio(
         "Workspace",
         options=[
@@ -154,131 +226,224 @@ else:
     )
 
 if app_mode == "Field Mode":
-
-    initialize_system()
-
     from ui.field_view import (
         render as render_field_view,
     )
 
     render_field_view()
-
     st.stop()
 
-initialize_system()
 
-# ---------------------------------------------------------
+# ==========================================================
 # SESSION STATE
-# ---------------------------------------------------------
+# ==========================================================
 
 DEFAULT_STATE = {
-
     "selected_customer": None,
-
     "selected_job": None,
-
     "selected_route": None,
-
     "refresh": False,
-
+    "schedule_select_all": False,
+    "schedule_editor_version": 0,
+    "dispatch_preview_routes": [],
 }
 
 for key, value in DEFAULT_STATE.items():
-
     if key not in st.session_state:
+        st.session_state[
+            key
+        ] = value
 
-        st.session_state[key] = value
 
-# ---------------------------------------------------------
+# ==========================================================
+# COMMON HELPERS
+# ==========================================================
+
+def safe_float(
+    value: Any,
+    fallback: float = 0.0,
+) -> float:
+    try:
+        if value is None or pd.isna(
+            value
+        ):
+            return float(
+                fallback
+            )
+
+        return float(
+            value
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return float(
+            fallback
+        )
+
+
+def safe_text(
+    value: Any,
+    fallback: str = "",
+) -> str:
+    if value is None:
+        return fallback
+
+    try:
+        if pd.isna(
+            value
+        ):
+            return fallback
+    except Exception:
+        pass
+
+    return str(
+        value
+    )
+
+
+def load_float_setting(
+    setting_key: str,
+    fallback: float,
+) -> float:
+    try:
+        return float(
+            get_setting(
+                setting_key,
+                str(
+                    fallback
+                ),
+            )
+            or fallback
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return float(
+            fallback
+        )
+
+
+def get_live_customers() -> pd.DataFrame:
+    try:
+        return list_customers()
+    except Exception:
+        st.error(
+            "Unable to load customers."
+        )
+        st.exception(
+            traceback.format_exc()
+        )
+        return pd.DataFrame()
+
+
+def get_live_dispatch() -> Dict[str, Any]:
+    try:
+        return dispatch_dashboard()
+    except Exception:
+        st.error(
+            "Unable to load dispatch."
+        )
+        st.exception(
+            traceback.format_exc()
+        )
+
+        return {
+            "jobs": [],
+            "route": [],
+            "manifest": [],
+            "summary": {},
+            "statistics": {},
+            "dataframe": pd.DataFrame(),
+        }
+
+
+# ==========================================================
 # HEADER
-# ---------------------------------------------------------
+# ==========================================================
 
-st.title("🌱 Time Out Lawncare")
+st.title(
+    "🌱 Time Out Lawncare"
+)
 
 stats = get_dashboard_stats()
 
-c1, c2, c3 = st.columns(3)
-
-with c1:
-
-    st.metric(
-        "Customers",
-        stats["total_customers"],
+header_1, header_2, header_3, header_4 = (
+    st.columns(
+        4
     )
+)
 
-with c2:
+header_1.metric(
+    "Customers",
+    stats.get(
+        "total_customers",
+        0,
+    ),
+)
 
-    st.metric(
-        "Queued Jobs",
-        stats["queued_jobs"],
-    )
+header_2.metric(
+    "Queued Jobs",
+    stats.get(
+        "queued_jobs",
+        0,
+    ),
+)
 
-with c3:
+header_3.metric(
+    "Completed",
+    stats.get(
+        "completed_jobs",
+        0,
+    ),
+)
 
-    st.metric(
-        "Completed",
-        stats["completed_jobs"],
-    )
+header_4.metric(
+    "Commercial",
+    (
+        stats.get(
+            "small_commercial_customers",
+            0,
+        )
+        + stats.get(
+            "commercial_customers",
+            0,
+        )
+    ),
+)
 
 st.divider()
 
-# ---------------------------------------------------------
-# LOAD DATA
-# ---------------------------------------------------------
+customers = (
+    get_live_customers()
+)
 
-try:
+dispatch = (
+    get_live_dispatch()
+)
 
-    customers = list_customers()
 
-except Exception:
-
-    st.error("Unable to load customers.")
-
-    st.exception(traceback.format_exc())
-
-    customers = pd.DataFrame()
-
-try:
-
-    dispatch = dispatch_dashboard()
-
-except Exception:
-
-    st.error("Unable to load dispatch.")
-
-    st.exception(traceback.format_exc())
-
-    dispatch = {
-
-        "jobs": [],
-
-        "route": [],
-
-        "manifest": [],
-
-        "summary": {},
-
-        "statistics": {},
-
-        "dataframe": pd.DataFrame(),
-
-    }
-
-# ---------------------------------------------------------
+# ==========================================================
 # TABS
-# ---------------------------------------------------------
+# ==========================================================
 
-tab_dashboard, \
-tab_customers, \
-tab_dispatch, \
-tab_schedule, \
-tab_treatments, \
-tab_applications, \
-tab_invoicing, \
-tab_routes, \
-tab_reports, \
-tab_import, \
-tab_settings = st.tabs(
+(
+    tab_dashboard,
+    tab_customers,
+    tab_dispatch,
+    tab_schedule,
+    tab_treatments,
+    tab_applications,
+    tab_invoicing,
+    tab_routes,
+    tab_reports,
+    tab_import,
+    tab_settings,
+) = st.tabs(
     [
         "Dashboard",
         "Customers",
@@ -294,118 +459,152 @@ tab_settings = st.tabs(
     ]
 )
 
+
 # ==========================================================
-# DASHBOARD TAB
+# DASHBOARD
 # ==========================================================
 
 with tab_dashboard:
+    st.header(
+        "Business Dashboard"
+    )
 
-    st.header("Business Dashboard")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        st.subheader("Business Statistics")
-
-        dashboard_stats = dispatch.get(
+    dashboard_stats = (
+        dispatch.get(
             "statistics",
-            {}
+            {},
         )
+    )
 
-        st.json(
-            dashboard_stats
+    dash_1, dash_2, dash_3, dash_4 = (
+        st.columns(
+            4
         )
+    )
 
-    with col2:
+    dash_1.metric(
+        "Dispatch Ready",
+        dashboard_stats.get(
+            "dispatch_ready",
+            dashboard_stats.get(
+                "queued",
+                0,
+            ),
+        ),
+    )
 
-        st.subheader("Today's Route Summary")
+    dash_2.metric(
+        "Dispatched",
+        dashboard_stats.get(
+            "dispatched",
+            0,
+        ),
+    )
 
-        summary = dispatch.get(
-            "summary",
-            {}
+    dash_3.metric(
+        "In Progress",
+        dashboard_stats.get(
+            "in_progress",
+            0,
+        ),
+    )
+
+    dash_4.metric(
+        "Completed",
+        dashboard_stats.get(
+            "completed",
+            0,
+        ),
+    )
+
+    future_queued = int(
+        dashboard_stats.get(
+            "future_queued_included",
+            dashboard_stats.get(
+                "future_active",
+                0,
+            ),
         )
+        or 0
+    )
 
-        if summary:
-
-            c1, c2 = st.columns(2)
-
-            with c1:
-
-                st.metric(
-                    "Stops",
-                    summary.get(
-                        "stops",
-                        0,
-                    ),
-                )
-
-                st.metric(
-                    "Miles",
-                    round(
-                        summary.get(
-                            "distance_miles",
-                            0,
-                        ),
-                        1,
-                    ),
-                )
-
-            with c2:
-
-                st.metric(
-                    "Drive Time",
-                    round(
-                        summary.get(
-                            "drive_minutes",
-                            0,
-                        ),
-                        1,
-                    ),
-                )
-
-                st.metric(
-                    "Total Time",
-                    round(
-                        summary.get(
-                            "total_minutes",
-                            0,
-                        ),
-                        1,
-                    ),
-                )
-
-            maps = summary.get(
-                "google_maps",
-                ""
-            )
-
-            if maps:
-
-                st.link_button(
-                    "Open Route in Google Maps",
-                    maps,
-                    use_container_width=True,
-                )
-
-        else:
-
-            st.info(
-                "No dispatch route has been generated."
-            )
+    if future_queued:
+        st.info(
+            f"{future_queued} queued job(s) have future scheduled dates "
+            "and are correctly included in the Dispatch-ready pool."
+        )
 
     st.divider()
 
     st.subheader(
-        "Today's Driver Manifest"
+        "Current Route Summary"
     )
+
+    summary = dispatch.get(
+        "summary",
+        {},
+    )
+
+    if summary:
+        summary_1, summary_2, summary_3, summary_4 = (
+            st.columns(
+                4
+            )
+        )
+
+        summary_1.metric(
+            "Stops",
+            int(
+                summary.get(
+                    "stops",
+                    0,
+                )
+                or 0
+            ),
+        )
+
+        summary_2.metric(
+            "Miles",
+            f"{safe_float(summary.get('distance_miles')):.1f}",
+        )
+
+        summary_3.metric(
+            "Drive",
+            f"{safe_float(summary.get('drive_minutes')):.0f} min",
+        )
+
+        summary_4.metric(
+            "Total",
+            f"{safe_float(summary.get('total_minutes')):.0f} min",
+        )
+
+        maps = safe_text(
+            summary.get(
+                "google_maps"
+            )
+        )
+
+        if maps:
+            st.link_button(
+                "Open Route in Google Maps",
+                maps,
+                use_container_width=True,
+            )
+
+    else:
+        st.info(
+            "No dispatch route is available."
+        )
 
     manifest = dispatch.get(
         "manifest",
-        []
+        [],
     )
 
     if manifest:
+        st.subheader(
+            "Driver Manifest"
+        )
 
         st.dataframe(
             pd.DataFrame(
@@ -415,1252 +614,1109 @@ with tab_dashboard:
             hide_index=True,
         )
 
-    else:
-
-        st.info(
-            "No jobs are currently queued."
-        )
-
 
 # ==========================================================
-# CUSTOMERS TAB
+# CUSTOMERS
 # ==========================================================
 
 with tab_customers:
-
-    st.header("Customers")
-
-    left, right = st.columns(
-        [3, 1]
+    st.header(
+        "Customers"
     )
 
-    with left:
+    st.caption(
+        "Customer Type keeps this screen organized. "
+        "It does not separate or restrict route optimization."
+    )
 
-        search = st.text_input(
+    type_col, search_col, status_col = (
+        st.columns(
+            [1.3, 2.4, 1]
+        )
+    )
+
+    customer_type_filter = (
+        type_col.selectbox(
+            "Customer Type",
+            options=[
+                "Residential",
+                "Small Commercial",
+                "Commercial",
+                "All",
+            ],
+            index=0,
+            key="customers_type_filter",
+        )
+    )
+
+    customer_search = (
+        search_col.text_input(
             "Search Customers",
-            placeholder="Name or address...",
+            placeholder=(
+                "Name, account, address, phone, email..."
+            ),
+            key="customer_search",
         )
+    )
 
-    with right:
+    active_filter = (
+        status_col.selectbox(
+            "Status",
+            options=[
+                "Active",
+                "All",
+            ],
+            key="customer_active_filter",
+        )
+    )
 
-        refresh = st.button(
-            "Refresh",
+    customer_df = filter_customers(
+        customers,
+        customer_type=(
+            customer_type_filter
+        ),
+        search=(
+            customer_search
+        ),
+        active_only=(
+            active_filter
+            == "Active"
+        ),
+    )
+
+    customer_metric_1, customer_metric_2 = (
+        st.columns(
+            2
+        )
+    )
+
+    customer_metric_1.metric(
+        "Shown",
+        len(
+            customer_df
+        ),
+    )
+
+    customer_metric_2.metric(
+        "All Customers",
+        len(
+            customers
+        ),
+    )
+
+    display_columns = [
+        column
+        for column
+        in (
+            "customer_number",
+            "name",
+            "account_name",
+            "customer_type",
+            "address",
+            "phone",
+            "email",
+            "square_feet",
+            "turf_type",
+            "service",
+            "quote",
+            "active",
+        )
+        if column
+        in customer_df.columns
+    ]
+
+    if customer_df.empty:
+        st.info(
+            "No customers match the selected view."
+        )
+    else:
+        st.dataframe(
+            customer_df[
+                display_columns
+            ],
             use_container_width=True,
+            hide_index=True,
         )
-
-    customer_df = customers.copy()
-
-    if search:
-
-        text = search.lower()
-
-        customer_df = customer_df[
-            customer_df.astype(str)
-            .apply(
-                lambda col:
-                col.str.lower()
-            )
-            .apply(
-                lambda col:
-                col.str.contains(
-                    text,
-                    na=False,
-                )
-            )
-            .any(axis=1)
-        ]
-
-    st.write(
-        f"Customers Found: {len(customer_df)}"
-    )
-
-    customer_display_df = customer_df.drop(
-        columns=[
-            "street_address",
-            "city",
-            "state",
-            "zip",
-            "county",
-        ],
-        errors="ignore",
-    )
-
-    st.dataframe(
-        customer_display_df,
-        use_container_width=True,
-        hide_index=True,
-    )
 
     st.divider()
 
-    st.subheader("Edit Customer")
+    edit_tab, add_tab = st.tabs(
+        [
+            "Edit Customer",
+            "Add Customer",
+        ]
+    )
 
-    if customers.empty:
+    with edit_tab:
+        if customers.empty:
+            st.info(
+                "No customers are available to edit."
+            )
+        else:
+            customer_options = (
+                customers[
+                    "id"
+                ]
+                .astype(
+                    int
+                )
+                .tolist()
+            )
 
-        st.info("No customers are available to edit.")
+            customer_labels = {}
 
-    else:
-
-        def customer_value(row, field, default=""):
-            value = row.get(field, default)
-            return default if pd.isna(value) else value
-
-        customer_options = (
-            customers["id"].astype(int).tolist()
-        )
-
-        customer_labels = {
-            int(row["id"]): (
-                f"{row['name']} — "
-                f"{customer_value(row, 'customer_number')}"
-            ).rstrip(" —")
-            for _, row in customers.iterrows()
-        }
-
-        edit_customer_id = st.selectbox(
-            "Choose Customer",
-            options=customer_options,
-            format_func=lambda value: (
-                customer_labels[value]
-            ),
-            key="edit_customer_selection",
-        )
-
-        selected_customer = customers[
-            customers["id"] == edit_customer_id
-        ].iloc[0]
-
-        with st.form("edit_customer_form"):
-
-            c1, c2 = st.columns(2)
-
-            customer_name = c1.text_input(
-                "Customer Name",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "name",
+            for _, row in customers.iterrows():
+                name = safe_text(
+                    row.get(
+                        "name"
                     )
-                ),
-            )
+                )
 
-            customer_number = c2.text_input(
-                "Customer Number",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "customer_number",
+                account = safe_text(
+                    row.get(
+                        "account_name"
                     )
-                ),
-            )
+                )
 
-            street_address = st.text_input(
-                "Street Address",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "street_address",
+                number = safe_text(
+                    row.get(
+                        "customer_number"
                     )
-                ),
-            )
+                )
 
-            city_col, state_col, zip_col = (
-                st.columns([2, 1, 1])
-            )
+                label = (
+                    account
+                    if account
+                    else name
+                )
 
-            city = city_col.text_input(
-                "City",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "city",
+                if account and name:
+                    label += (
+                        f" — {name}"
                     )
-                ),
-            )
 
-            state = state_col.text_input(
-                "State",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "state",
+                if number:
+                    label += (
+                        f" — #{number}"
                     )
-                ),
-            )
 
-            zipcode = zip_col.text_input(
-                "ZIP",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "zip",
+                customer_labels[
+                    int(
+                        row[
+                            "id"
+                        ]
                     )
-                ),
+                ] = label
+
+            edit_customer_id = (
+                st.selectbox(
+                    "Choose Customer",
+                    options=customer_options,
+                    format_func=lambda value: (
+                        customer_labels[
+                            value
+                        ]
+                    ),
+                    key="edit_customer_selection",
+                )
             )
 
-            county = st.text_input(
-                "County",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "county",
+            selected_customer = (
+                customers[
+                    customers[
+                        "id"
+                    ].astype(
+                        int
                     )
-                ),
-            )
-
-            phone_col, email_col = st.columns(2)
-
-            phone = phone_col.text_input(
-                "Phone Number",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "phone",
+                    == int(
+                        edit_customer_id
                     )
-                ),
+                ]
+                .iloc[0]
             )
 
-            email = email_col.text_input(
-                "Email Address",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "email",
+            current_type = (
+                safe_text(
+                    selected_customer.get(
+                        "customer_type"
+                    ),
+                    "Residential",
+                )
+            )
+
+            if current_type not in CUSTOMER_TYPES:
+                current_type = (
+                    "Residential"
+                )
+
+            with st.form(
+                "edit_customer_form"
+            ):
+                edit_1, edit_2, edit_3 = (
+                    st.columns(
+                        [2, 1, 1]
                     )
-                ),
-            )
+                )
 
-            text_phone = st.text_input(
-                "Text Address",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "text_phone",
+                customer_name = (
+                    edit_1.text_input(
+                        "Customer / Contact Name",
+                        value=safe_text(
+                            selected_customer.get(
+                                "name"
+                            )
+                        ),
                     )
-                ),
-            )
+                )
 
-            area_col, quote_col = st.columns(2)
-
-            square_feet = area_col.number_input(
-                "Square Feet",
-                min_value=0.0,
-                value=float(
-                    customer_value(
-                        selected_customer,
-                        "square_feet",
-                        0,
+                customer_number = (
+                    edit_2.text_input(
+                        "Customer Number",
+                        value=safe_text(
+                            selected_customer.get(
+                                "customer_number"
+                            )
+                        ),
                     )
-                    or 0
-                ),
-            )
+                )
 
-            quote = quote_col.number_input(
-                "Quote",
-                min_value=0.0,
-                value=float(
-                    customer_value(
-                        selected_customer,
-                        "quote",
-                        0,
+                customer_type = (
+                    edit_3.selectbox(
+                        "Customer Type",
+                        options=list(
+                            CUSTOMER_TYPES
+                        ),
+                        index=list(
+                            CUSTOMER_TYPES
+                        ).index(
+                            current_type
+                        ),
                     )
-                    or 0
-                ),
-                format="%.2f",
-            )
+                )
 
-            turf_col, irrigation_col = (
-                st.columns(2)
-            )
-
-            turf_type = turf_col.text_input(
-                "Turf Type",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "turf_type",
+                account_name = (
+                    st.text_input(
+                        "Commercial Account / Property Name",
+                        value=safe_text(
+                            selected_customer.get(
+                                "account_name"
+                            )
+                        ),
+                        help=(
+                            "Optional. Useful for commercial accounts "
+                            "where the property/account name differs "
+                            "from the contact name."
+                        ),
                     )
-                ),
-            )
+                )
 
-            irrigation = irrigation_col.text_input(
-                "Irrigation",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "irrigation",
+                street_address = (
+                    st.text_input(
+                        "Street Address",
+                        value=safe_text(
+                            selected_customer.get(
+                                "street_address"
+                            )
+                        ),
                     )
-                ),
-            )
+                )
 
-            payment_method = st.text_input(
-                "Payment Method",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "payment_method",
+                city_col, state_col, zip_col = (
+                    st.columns(
+                        [2, 1, 1]
                     )
-                ),
-            )
+                )
 
-            notes = st.text_area(
-                "Notes",
-                value=str(
-                    customer_value(
-                        selected_customer,
-                        "special_instructions",
+                city = (
+                    city_col.text_input(
+                        "City",
+                        value=safe_text(
+                            selected_customer.get(
+                                "city"
+                            )
+                        ),
                     )
-                ),
-            )
+                )
 
-            active = st.checkbox(
-                "Active Customer",
-                value=bool(
-                    customer_value(
-                        selected_customer,
-                        "active",
-                        1,
+                state = (
+                    state_col.text_input(
+                        "State",
+                        value=safe_text(
+                            selected_customer.get(
+                                "state"
+                            )
+                        ),
                     )
-                ),
+                )
+
+                zipcode = (
+                    zip_col.text_input(
+                        "ZIP",
+                        value=safe_text(
+                            selected_customer.get(
+                                "zip"
+                            )
+                        ),
+                    )
+                )
+
+                county = (
+                    st.text_input(
+                        "County",
+                        value=safe_text(
+                            selected_customer.get(
+                                "county"
+                            )
+                        ),
+                    )
+                )
+
+                phone_col, email_col = (
+                    st.columns(
+                        2
+                    )
+                )
+
+                phone = phone_col.text_input(
+                    "Phone",
+                    value=safe_text(
+                        selected_customer.get(
+                            "phone"
+                        )
+                    ),
+                )
+
+                email = email_col.text_input(
+                    "Email",
+                    value=safe_text(
+                        selected_customer.get(
+                            "email"
+                        )
+                    ),
+                )
+
+                text_phone = (
+                    st.text_input(
+                        "Text Phone",
+                        value=safe_text(
+                            selected_customer.get(
+                                "text_phone"
+                            )
+                        ),
+                    )
+                )
+
+                area_col, quote_col = (
+                    st.columns(
+                        2
+                    )
+                )
+
+                square_feet = (
+                    area_col.number_input(
+                        "Square Feet",
+                        min_value=0.0,
+                        value=safe_float(
+                            selected_customer.get(
+                                "square_feet"
+                            )
+                        ),
+                    )
+                )
+
+                quote = (
+                    quote_col.number_input(
+                        "Quote",
+                        min_value=0.0,
+                        value=safe_float(
+                            selected_customer.get(
+                                "quote"
+                            )
+                        ),
+                        format="%.2f",
+                    )
+                )
+
+                turf_col, irrigation_col = (
+                    st.columns(
+                        2
+                    )
+                )
+
+                turf_type = (
+                    turf_col.text_input(
+                        "Turf Type",
+                        value=safe_text(
+                            selected_customer.get(
+                                "turf_type"
+                            )
+                        ),
+                    )
+                )
+
+                irrigation = (
+                    irrigation_col.text_input(
+                        "Irrigation",
+                        value=safe_text(
+                            selected_customer.get(
+                                "irrigation"
+                            )
+                        ),
+                    )
+                )
+
+                payment_method = (
+                    st.text_input(
+                        "Payment Method",
+                        value=safe_text(
+                            selected_customer.get(
+                                "payment_method"
+                            )
+                        ),
+                    )
+                )
+
+                service = (
+                    st.text_input(
+                        "Primary Service",
+                        value=safe_text(
+                            selected_customer.get(
+                                "service"
+                            )
+                        ),
+                    )
+                )
+
+                special_instructions = (
+                    st.text_area(
+                        "Special Instructions / Notes",
+                        value=safe_text(
+                            selected_customer.get(
+                                "special_instructions"
+                            )
+                        ),
+                    )
+                )
+
+                active = (
+                    st.checkbox(
+                        "Active Customer",
+                        value=bool(
+                            selected_customer.get(
+                                "active",
+                                1,
+                            )
+                        ),
+                    )
+                )
+
+                save_customer = (
+                    st.form_submit_button(
+                        "Save Customer Changes",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                )
+
+                if save_customer:
+                    if not customer_name.strip():
+                        st.error(
+                            "Customer name is required."
+                        )
+                    else:
+                        try:
+                            edit_customer(
+                                int(
+                                    edit_customer_id
+                                ),
+                                customer_number=(
+                                    customer_number.strip()
+                                    or None
+                                ),
+                                name=(
+                                    customer_name.strip()
+                                ),
+                                customer_type=(
+                                    customer_type
+                                ),
+                                account_name=(
+                                    account_name.strip()
+                                    or None
+                                ),
+                                street_address=(
+                                    street_address.strip()
+                                ),
+                                city=(
+                                    city.strip()
+                                ),
+                                state=(
+                                    state.strip()
+                                ),
+                                zip=(
+                                    zipcode.strip()
+                                ),
+                                county=(
+                                    county.strip()
+                                ),
+                                phone=(
+                                    phone.strip()
+                                ),
+                                email=(
+                                    email.strip()
+                                ),
+                                text_phone=(
+                                    text_phone.strip()
+                                ),
+                                square_feet=(
+                                    square_feet
+                                ),
+                                turf_type=(
+                                    turf_type.strip()
+                                ),
+                                irrigation=(
+                                    irrigation.strip()
+                                ),
+                                payment_method=(
+                                    payment_method.strip()
+                                ),
+                                quote=quote,
+                                special_instructions=(
+                                    special_instructions.strip()
+                                ),
+                                service=(
+                                    service.strip()
+                                ),
+                                active=int(
+                                    active
+                                ),
+                            )
+
+                        except Exception as exc:
+                            st.error(
+                                "Customer could not be updated: "
+                                f"{exc}"
+                            )
+                        else:
+                            st.success(
+                                "Customer updated successfully."
+                            )
+                            st.rerun()
+
+    with add_tab:
+        with st.form(
+            "add_customer_form"
+        ):
+            add_1, add_2 = (
+                st.columns(
+                    2
+                )
             )
 
-            save_customer = (
+            new_name = (
+                add_1.text_input(
+                    "Customer / Contact Name"
+                )
+            )
+
+            new_type = (
+                add_2.selectbox(
+                    "Customer Type",
+                    options=list(
+                        CUSTOMER_TYPES
+                    ),
+                )
+            )
+
+            new_account = (
+                st.text_input(
+                    "Commercial Account / Property Name"
+                )
+            )
+
+            new_address = (
+                st.text_input(
+                    "Address"
+                )
+            )
+
+            new_service = (
+                st.text_input(
+                    "Service"
+                )
+            )
+
+            add_customer_submit = (
                 st.form_submit_button(
-                    "Save Customer Changes",
+                    "Add Customer",
                     type="primary",
                     use_container_width=True,
                 )
             )
 
-            if save_customer:
+            if add_customer_submit:
+                try:
+                    create_customer(
+                        name=(
+                            new_name
+                        ),
+                        address=(
+                            new_address
+                        ),
+                        service=(
+                            new_service
+                        ),
+                        customer_type=(
+                            new_type
+                        ),
+                        account_name=(
+                            new_account.strip()
+                            or None
+                        ),
+                    )
 
-                if not customer_name.strip():
-
+                except Exception as exc:
                     st.error(
-                        "Customer name is required."
+                        f"Customer could not be added: {exc}"
                     )
-
                 else:
-
-                    full_address = ", ".join(
-                        part.strip()
-                        for part in [
-                            street_address,
-                            city,
-                            state,
-                            zipcode,
-                        ]
-                        if part.strip()
+                    st.success(
+                        "Customer added successfully."
                     )
-
-                    try:
-
-                        update_customer(
-                            edit_customer_id,
-                            customer_number=(
-                                customer_number.strip()
-                                or None
-                            ),
-                            name=customer_name.strip(),
-                            address=full_address,
-                            street_address=(
-                                street_address.strip()
-                            ),
-                            city=city.strip(),
-                            state=state.strip(),
-                            zip=zipcode.strip(),
-                            county=county.strip(),
-                            phone=phone.strip(),
-                            email=email.strip(),
-                            text_phone=(
-                                text_phone.strip()
-                            ),
-                            square_feet=square_feet,
-                            turf_type=turf_type.strip(),
-                            irrigation=(
-                                irrigation.strip()
-                            ),
-                            payment_method=(
-                                payment_method.strip()
-                            ),
-                            quote=quote,
-                            special_instructions=(
-                                notes.strip()
-                            ),
-                            active=int(active),
-                        )
-
-                    except Exception as exc:
-
-                        st.error(
-                            "Customer could not be "
-                            f"updated: {exc}"
-                        )
-
-                    else:
-
-                        st.success(
-                            "Customer updated "
-                            "successfully."
-                        )
-
-                        st.rerun()
-
-    st.divider()
+                    st.rerun()
 
 
-    st.subheader(
-        "Quick Add Customer"
-    )
-
-    with st.form(
-        "quick_add_customer"
-    ):
-
-        name = st.text_input(
-            "Customer Name"
-        )
-
-        address = st.text_input(
-            "Address"
-        )
-
-        service = st.text_input(
-            "Service"
-        )
-
-        submitted = st.form_submit_button(
-            "Add Customer"
-        )
-
-        if submitted:
-
-            try:
-
-                from core.crm import (
-                    create_customer,
-                )
-
-                create_customer(
-                    name=name,
-                    address=address,
-                    service=service,
-                )
-
-                st.success(
-                    "Customer added successfully."
-                )
-
-                st.rerun()
-
-            except Exception:
-
-                st.exception(
-                    traceback.format_exc()
-                )
-                
 # ==========================================================
-# DISPATCH TAB
+# DISPATCH
 # ==========================================================
 
 with tab_dispatch:
-
-    st.header("Dispatch")
-
-    dispatch_date = st.date_input(
-        "Dispatch Date",
-        value=date.today(),
-        key="dispatch_selected_date",
-        help=(
-            "Select today or a future service date to "
-            "view its queue, route, manifest, and load sheet."
-        ),
+    st.header(
+        "Dispatch"
     )
 
-    dispatch = dispatch_dashboard(
-        scheduled_date=dispatch_date
+    st.caption(
+        "Every queued job is available here regardless of its scheduled date."
     )
 
-    dispatch_statistics = dispatch.get(
+    queued_jobs = dispatch.get(
+        "jobs",
+        [],
+    )
+
+    dispatch_stats = dispatch.get(
         "statistics",
         {},
     )
 
-    if dispatch_date == date.today():
-        st.caption(
-            "Showing today's active dispatch queue."
+    dispatch_1, dispatch_2, dispatch_3, dispatch_4 = (
+        st.columns(
+            4
         )
-    else:
-        st.caption(
-            f"Showing the active dispatch queue for "
-            f"{dispatch_date:%B %d, %Y}."
-        )
-    
-# ==========================================================
-# Dispatch Dashboard
-# ==========================================================
-
-    from core.crm import list_customers
-
-    import pandas as pd
-
-    customers = list_customers()
-
-    if customers is None:
-        customers = pd.DataFrame()
-
-    selected_jobs = dispatch.get(
-        "jobs",
-        [],
     )
 
-    selected_queued = sum(
-        str(job.get("status", "")).lower()
-        == "queued"
-        for job in selected_jobs
-    )
-
-    selected_in_progress = sum(
-        str(job.get("status", "")).lower()
-        == "in_progress"
-        for job in selected_jobs
-    )
-
-    st.subheader(
-        f"Operations — {dispatch_date:%B %d, %Y}"
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "All Customers",
-        len(customers),
-    )
-
-    c2.metric(
-        "Queued",
-        selected_queued,
-    )
-
-    c3.metric(
-        "In Progress",
-        selected_in_progress,
-    )
-
-    c4.metric(
-        "Future Active Jobs",
-        int(
-            dispatch_statistics.get(
-                "future_active",
-                0,
-            )
+    dispatch_1.metric(
+        "Dispatch Ready",
+        len(
+            queued_jobs
         ),
     )
 
-    st.divider()
-    
-# ==========================================================
-# Dispatch Action Center
-# ==========================================================
-
-    st.subheader("Action Center")
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    optimize_route = col1.button(
-        "🛣️ Optimize Route",
-        use_container_width=True,
+    dispatch_2.metric(
+        "In Progress",
+        dispatch_stats.get(
+            "in_progress",
+            0,
+        ),
     )
 
-    start_route = col2.button(
-        "🚚 Start Route",
-        use_container_width=True,
+    dispatch_3.metric(
+        "Completed",
+        dispatch_stats.get(
+            "completed",
+            0,
+        ),
     )
 
-    print_route = col3.button(
-        "🖨️ Print Route",
-        use_container_width=True,
+    dispatch_4.metric(
+        "Future-Dated Queued",
+        dispatch_stats.get(
+            "future_queued_included",
+            0,
+        ),
     )
 
-    driver_mode = col4.button(
-        "📱 Driver Mode",
-        use_container_width=True,
-    )
-
-    if optimize_route:
-        st.info("Route optimization will be connected next.")
-
-    if start_route:
-        st.success("Route started.")
-
-    if print_route:
-        st.info("Printable route sheet coming soon.")
-
-    if driver_mode:
-        st.info("Driver Mode coming soon.")
-
-    st.divider()
-
-    @st.dialog(
-        "Complete Dispatch Stop",
-        width="large",
-    )
-    def complete_dispatch_stop(
-        dispatch_job_id: int,
-    ):
-
-        from datetime import date
-
-        from core.treatment_manager import (
-            complete_treatment_event,
-            get_active_applicators,
-            get_dispatch_treatment_events,
-            get_treatment_products,
+    if queued_jobs:
+        st.subheader(
+            "Dispatch Pool"
         )
 
-        from ui.dispatch import (
-            mark_job_complete,
-        )
-
-        treatment_events = (
-            get_dispatch_treatment_events(
-                dispatch_job_id
+        dispatch_pool_df = (
+            pd.DataFrame(
+                queued_jobs
             )
         )
 
-        if treatment_events.empty:
-
-            st.info(
-                "This is not linked to a treatment record."
+        pool_columns = [
+            column
+            for column
+            in (
+                "id",
+                "name",
+                "account_name",
+                "customer_type",
+                "treatment_name",
+                "service",
+                "scheduled_date",
+                "address",
+                "status",
             )
-
-            if st.button(
-                "Complete Stop",
-                type="primary",
-                use_container_width=True,
-            ):
-
-                mark_job_complete(
-                    dispatch_job_id
-                )
-
-                st.rerun()
-
-            return
-
-        application_date = st.date_input(
-            "Application Date",
-            value=date.today(),
-            key=(
-                "dispatch_application_date_"
-                f"{dispatch_job_id}"
-            ),
-        )
-
-        applicators = get_active_applicators()
-
-        if applicators.empty:
-
-            st.error(
-                "No active applicators are available."
-            )
-
-            return
-
-        applicator_labels = {
-            int(row["id"]): (
-                f"{row['name']} — "
-                f"ID {row['id_number'] or 'Not entered'}"
-            )
-            for _, row in applicators.iterrows()
-        }
-
-        selected_applicator_id = st.selectbox(
-            "Applicator",
-            options=list(applicator_labels),
-            format_func=lambda value: (
-                applicator_labels[value]
-            ),
-            key=(
-                "office_applicator_"
-                f"{dispatch_job_id}"
-            ),
-        )
-
-        completion_notes = st.text_area(
-            "Application Notes",
-            key=(
-                "dispatch_completion_notes_"
-                f"{dispatch_job_id}"
-            ),
-        )
-
-        from data.database import (
-            get_setting,
-        )
-
-        try:
-            completion_spot_gallons = float(
-                get_setting(
-                    "spot_tank_gallons",
-                    "1.0",
-                )
-                or 1.0
-            )
-        except (TypeError, ValueError):
-            completion_spot_gallons = 1.0
-
-        completion_records = []
-
-        for _, event in treatment_events.iterrows():
-
-            event_id = int(event["id"])
-            treatment_id = int(
-                event["treatment_id"]
-            )
-
-            st.subheader(
-                str(event["treatment"])
-            )
-
-            square_feet = float(
-                event["square_feet"] or 0
-            )
-
-            acres = square_feet / 43560.0
-
-            application_method = str(
-                event.get(
-                    "application_method",
-                    "broadcast",
-                )
-                or "broadcast"
-            ).strip().lower()
-
-            is_spot_completion = (
-                application_method == "spot"
-            )
-
-            completion_rate_label = (
-                "Rate Per Gallon"
-                if is_spot_completion
-                else "Rate Per Acre"
-            )
-
-            rate_basis_quantity = (
-                max(
-                    completion_spot_gallons,
-                    0.1,
-                )
-                if is_spot_completion
-                else acres
-            )
-
-            st.caption(
-                (
-                    f"Spot-treatment batch: "
-                    f"{rate_basis_quantity:g} gallons"
-                )
-                if is_spot_completion
-                else (
-                    f"{square_feet:,.0f} sq ft "
-                    f"({acres:.4f} acres)"
-                )
-            )
-
-            chemicals = get_treatment_products(
-                treatment_id
-            )
-
-            chemical_rows = []
-
-            for _, chemical in chemicals.iterrows():
-
-                rate = float(
-                    chemical["rate_per_acre"]
-                    or 0
-                )
-
-                calculated = (
-                    rate
-                    * rate_basis_quantity
-                )
-
-                chemical_rows.append(
-                    {
-                        "product_id": int(
-                            chemical["product_id"]
-                        ),
-                        "Chemical": chemical[
-                            "product_name"
-                        ],
-                        "EPA Number": chemical[
-                            "epa_number"
-                        ],
-                        completion_rate_label: rate,
-                        "Unit": chemical[
-                            "rate_unit"
-                        ],
-                        "Calculated": round(
-                            calculated,
-                            4,
-                        ),
-                        "Actual Total": round(
-                            calculated,
-                            4,
-                        ),
-                    }
-                )
-
-            if chemical_rows:
-
-                edited_chemicals = st.data_editor(
-                    pd.DataFrame(
-                        chemical_rows
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                    disabled=[
-                        "product_id",
-                        "Chemical",
-                        "EPA Number",
-                        completion_rate_label,
-                        "Unit",
-                        "Calculated",
-                    ],
-                    column_config={
-                        "product_id": None,
-                        "Actual Total": (
-                            st.column_config.NumberColumn(
-                                "Actual Total",
-                                min_value=0.0,
-                                format="%.4f",
-                            )
-                        ),
-                    },
-                    key=(
-                        "dispatch_actual_"
-                        f"{event_id}"
-                    ),
-                )
-
-                actual_amounts = {
-                    int(row["product_id"]): float(
-                        row["Actual Total"]
-                    )
-                    for _, row
-                    in edited_chemicals.iterrows()
-                }
-
-            else:
-
-                actual_amounts = {}
-
-                st.warning(
-                    "No chemicals are assigned "
-                    "to this treatment."
-                )
-
-            completion_records.append(
-                {
-                    "event_id": event_id,
-                    "actual_amounts": actual_amounts,
-                }
-            )
-
-        if st.button(
-            "Complete Stop and Save Applications",
-            type="primary",
-            use_container_width=True,
-        ):
-
-            for record in completion_records:
-
-                complete_treatment_event(
-                    event_id=record["event_id"],
-                    notes=completion_notes,
-                    application_date=application_date,
-                    actual_amounts=record[
-                        "actual_amounts"
-                    ],
-                    applicator_employee_id=(
-                        selected_applicator_id
-                    ),
-                )
-
-            st.success(
-                "Stop completed and application "
-                "records saved."
-            )
-
-            st.rerun()
-    
-# ==========================================================
-# SELECTED DATE STOPS
-# ==========================================================
-
-    st.subheader(
-        f"Stops for {dispatch_date:%B %d, %Y}"
-    )
-
-    scheduled_stops = dispatch.get(
-        "jobs",
-        [],
-    )
-
-    if not scheduled_stops:
-
-        st.info(
-            "There are no queued stops."
-        )
-
-    else:
-
-        for index, row in enumerate(
-            scheduled_stops
-        ):
-
-            with st.container(border=True):
-
-                c1, c2, c3, c4, c5, c6 = st.columns(
-                    [5, 1, 1, 1, 1.2, 1.6]
-                )
-
-                with c1:
-
-                    st.markdown(
-                        f"**{index + 1}. "
-                        f"{row.get('name', '')}**"
-                    )
-
-                    treatment_name = (
-                        row.get("treatment_name")
-                        or row.get("service")
-                        or ""
-                    )
-
-                    st.caption(
-                        f"Treatment: {treatment_name}"
-                    )
-
-                    st.write(
-                        row.get("address", "")
-                    )
-
-                    if row.get("scheduled_date"):
-
-                        st.caption(
-                            "Scheduled: "
-                            f"{row['scheduled_date']}"
-                        )
-
-                with c2:
-
-                    address = str(
-                        row.get("address", "")
-                    ).strip()
-
-                    if address:
-
-                        maps_url = (
-                            "https://www.google.com/maps/"
-                            "search/?api=1&query="
-                            + address.replace(" ", "+")
-                        )
-
-                        st.link_button(
-                            "📍",
-                            maps_url,
-                            use_container_width=True,
-                        )
-
-                with c3:
-
-                    phone = str(
-                        row.get("phone", "")
-                    ).strip()
-
-                    if phone:
-
-                        st.link_button(
-                            "📞",
-                            f"tel:{phone}",
-                            use_container_width=True,
-                        )
-
-                with c4:
-
-                    text_number = str(
-                        row.get(
-                            "text_phone",
-                            row.get("phone", ""),
-                        )
-                    ).strip()
-
-                    if text_number:
-
-                        st.link_button(
-                            "💬",
-                            f"sms:{text_number}",
-                            use_container_width=True,
-                        )
-
-                with c5:
-
-                    job_status = str(
-                        row.get("status", "")
-                    )
-
-                    if job_status == "queued":
-
-                        if st.button(
-                            "Arrived",
-                            key=f"arrived_{row['id']}",
-                            use_container_width=True,
-                        ):
-
-                            from ui.dispatch import (
-                                mark_job_in_progress,
-                            )
-
-                            mark_job_in_progress(
-                                int(row["id"])
-                            )
-
-                            st.rerun()
-
-                    elif job_status == "in_progress":
-
-                        st.success("Arrived")
-
-                    elif job_status == "completed":
-
-                        st.success("Completed")
-
-                with c6:
-
-                    if row.get("status") in {
-                        "queued",
-                        "in_progress",
-                    }:
-
-                        if st.button(
-                            "Completed",
-                            key=(
-                                "complete_stop_"
-                                f"{row['id']}"
-                            ),
-                            use_container_width=True,
-                        ):
-
-                            complete_dispatch_stop(
-                                int(row["id"])
-                            )
-
-        st.caption(
-            "Complete treatment visits from the Treatments "
-            "tab so actual chemical amounts are recorded."
-        )
-
-        st.divider()
-
-    left, middle, right, far_right = st.columns(4)
-
-    with left:
-
-        if st.button(
-            "Generate Optimized Route",
-            use_container_width=True,
-            key="dispatch_generate_route",
-        ):
-
-            dispatch = dispatch_dashboard(
-                scheduled_date=dispatch_date
-            )
-
-            st.success(
-                "Dispatch route generated."
-            )
-
-    with middle:
-
-        if st.button(
-            "Refresh Dispatch",
-            use_container_width=True,
-            key="dispatch_refresh",
-        ):
-
-            st.rerun()
-
-    with right:
-
-        if st.button(
-            "Clear Selected Date",
-            use_container_width=True,
-            type="secondary",
-            key="dispatch_clear_selected_queue",
-        ):
-
-            from ui.dispatch import (
-                cancel_queue_for_date,
-            )
-
-            cancel_queue_for_date(
-                scheduled_date=dispatch_date
-            )
-
-            st.success(
-                f"Queue cleared for "
-                f"{dispatch_date:%B %d, %Y}."
-            )
-
-            st.rerun()
-
-    with far_right:
-
-        if st.button(
-            "Clear All Dates",
-            use_container_width=True,
-            type="secondary",
-            key="dispatch_clear_all_queues",
-            help=(
-                "Cancel every queued or in-progress job "
-                "across all service dates."
-            ),
-        ):
-
-            from ui.dispatch import (
-                cancel_entire_queue,
-            )
-
-            cancel_entire_queue()
-
-            st.success(
-                "All active dispatch queues cleared."
-            )
-
-            st.rerun()
-
-    st.divider()
-
-    st.subheader(
-        f"Queued Jobs — {dispatch_date:%B %d, %Y}"
-    )
-
-    jobs = dispatch.get(
-        "jobs",
-        [],
-    )
-
-    if jobs:
+            if column
+            in dispatch_pool_df.columns
+        ]
 
         st.dataframe(
-            pd.DataFrame(jobs),
+            dispatch_pool_df[
+                pool_columns
+            ],
             use_container_width=True,
             hide_index=True,
+            column_config={
+                "id": None,
+                "name": "Customer",
+                "account_name": "Account",
+                "customer_type": "Type",
+                "treatment_name": "Treatment",
+                "scheduled_date": "Scheduled",
+                "address": "Address",
+                "status": "Status",
+            },
         )
 
     else:
-
         st.info(
             "There are no queued jobs."
         )
 
     st.divider()
 
-    st.subheader("Daily Load Sheet")
-
-    from data.database import (
-        get_setting,
+    st.subheader(
+        "Crew Dispatch Builder"
     )
 
-    if st.session_state.pop(
-        "reload_spray_defaults",
-        False,
-    ):
-        for widget_key in [
-            "dispatch_water_gpa",
-            "dispatch_large_tank",
-            "dispatch_small_tank",
-            "dispatch_spot_tank",
-        ]:
-            st.session_state.pop(
-                widget_key,
-                None,
-            )
+    active_crews = get_crews(
+        active_only=True
+    )
 
-    def load_float_setting(
-        setting_key,
-        fallback,
+    if (
+        active_crews is None
+        or active_crews.empty
     ):
-        try:
-            return float(
-                get_setting(
-                    setting_key,
-                    str(fallback),
+        st.warning(
+            "No active crews are configured. "
+            "Add at least one crew in Settings."
+        )
+
+        selected_crew_ids: List[int] = []
+
+    else:
+        crew_labels = {
+            int(
+                row[
+                    "id"
+                ]
+            ): safe_text(
+                row.get(
+                    "crew_name"
                 )
-                or fallback
             )
-        except (TypeError, ValueError):
-            return float(fallback)
+            for _, row in active_crews.iterrows()
+        }
 
-    saved_water_gpa = load_float_setting(
-        "water_gallons_per_acre",
-        20.0,
+        selected_crew_ids = (
+            st.multiselect(
+                "Crews for this Dispatch",
+                options=list(
+                    crew_labels
+                ),
+                default=list(
+                    crew_labels
+                ),
+                format_func=lambda value: (
+                    crew_labels[
+                        value
+                    ]
+                ),
+            )
+        )
+
+    max_stops = (
+        st.number_input(
+            "Maximum Stops per Route",
+            min_value=1,
+            max_value=50,
+            value=int(
+                load_float_setting(
+                    "max_stops_per_route",
+                    10,
+                )
+            ),
+            step=1,
+        )
     )
 
-    saved_large_tank = load_float_setting(
-        "large_tank_gallons",
-        200.0,
+    preview_col, create_col, clear_col = (
+        st.columns(
+            3
+        )
     )
 
-    saved_small_tank = load_float_setting(
-        "small_tank_gallons",
-        30.0,
+    preview_routes = (
+        preview_col.button(
+            "Preview Crew Routes",
+            use_container_width=True,
+            disabled=(
+                not queued_jobs
+                or not selected_crew_ids
+            ),
+        )
     )
 
-    saved_spot_tank = load_float_setting(
-        "spot_tank_gallons",
-        1.0,
+    create_dispatches = (
+        create_col.button(
+            "Create Crew Dispatches",
+            type="primary",
+            use_container_width=True,
+            disabled=(
+                not queued_jobs
+                or not selected_crew_ids
+            ),
+        )
     )
 
-    (
-        load_col1,
-        load_col2,
-        load_col3,
-        load_col4,
-    ) = st.columns(4)
-
-    load_gallons_per_acre = load_col1.number_input(
-        "Water Gallons Per Acre",
-        min_value=0.1,
-        value=saved_water_gpa,
-        step=1.0,
-        key="dispatch_water_gpa",
+    clear_queue = (
+        clear_col.button(
+            "Clear Active Queue",
+            use_container_width=True,
+            type="secondary",
+            disabled=(
+                not queued_jobs
+            ),
+        )
     )
 
-    large_tank_size = load_col2.number_input(
-        "Large Tank Gallons",
-        min_value=1.0,
-        value=saved_large_tank,
-        step=5.0,
-        key="dispatch_large_tank",
+    if preview_routes:
+        selected_crews = (
+            active_crews[
+                active_crews[
+                    "id"
+                ]
+                .astype(
+                    int
+                )
+                .isin(
+                    selected_crew_ids
+                )
+            ]
+            .to_dict(
+                "records"
+            )
+        )
+
+        st.session_state[
+            "dispatch_preview_routes"
+        ] = build_multi_driver_routes(
+            crews=selected_crews,
+            max_stops_per_route=int(
+                max_stops
+            ),
+        )
+
+    if create_dispatches:
+        selected_crews = (
+            active_crews[
+                active_crews[
+                    "id"
+                ]
+                .astype(
+                    int
+                )
+                .isin(
+                    selected_crew_ids
+                )
+            ]
+            .to_dict(
+                "records"
+            )
+        )
+
+        try:
+            created = (
+                create_multi_crew_dispatch(
+                    selected_crews,
+                    dispatch_date=date.today(),
+                    max_stops_per_route=int(
+                        max_stops
+                    ),
+                )
+            )
+
+        except Exception:
+            st.error(
+                "Crew dispatches could not be created."
+            )
+            st.exception(
+                traceback.format_exc()
+            )
+        else:
+            st.success(
+                f"Created {len(created)} crew dispatch(es)."
+            )
+
+            st.session_state[
+                "dispatch_preview_routes"
+            ] = []
+
+            st.rerun()
+
+    if clear_queue:
+        cancel_entire_queue()
+        st.success(
+            "Active dispatch queue cleared."
+        )
+        st.rerun()
+
+    preview = st.session_state.get(
+        "dispatch_preview_routes",
+        [],
     )
 
-    small_tank_size = load_col3.number_input(
-        "Small Tank Gallons",
-        min_value=1.0,
-        value=saved_small_tank,
-        step=1.0,
-        key="dispatch_small_tank",
+    if preview:
+        st.divider()
+        st.subheader(
+            "Crew Route Preview"
+        )
+
+        for crew_route in preview:
+            st.markdown(
+                f"### {crew_route.get('crew', 'Crew')}"
+            )
+
+            route_summary = (
+                crew_route.get(
+                    "summary",
+                    {},
+                )
+            )
+
+            p1, p2, p3, p4 = (
+                st.columns(
+                    4
+                )
+            )
+
+            p1.metric(
+                "Stops",
+                int(
+                    route_summary.get(
+                        "stops",
+                        0,
+                    )
+                ),
+            )
+
+            p2.metric(
+                "Miles",
+                f"{safe_float(route_summary.get('distance_miles')):.1f}",
+            )
+
+            p3.metric(
+                "Drive",
+                f"{safe_float(route_summary.get('drive_minutes')):.0f} min",
+            )
+
+            p4.metric(
+                "Total",
+                f"{safe_float(route_summary.get('total_minutes')):.0f} min",
+            )
+
+            maps = (
+                crew_route.get(
+                    "google_maps"
+                )
+                or route_summary.get(
+                    "google_maps"
+                )
+            )
+
+            if maps:
+                st.link_button(
+                    f"Open {crew_route.get('crew', 'Crew')} Route in Google Maps",
+                    maps,
+                    use_container_width=True,
+                )
+
+            manifest = crew_route.get(
+                "manifest",
+                [],
+            )
+
+            if manifest:
+                st.dataframe(
+                    pd.DataFrame(
+                        manifest
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    st.divider()
+
+    st.subheader(
+        "Saved Crew Dispatches"
     )
 
-    spot_tank_size = load_col4.number_input(
-        "Spot Treatment Gallons",
-        min_value=0.1,
-        value=saved_spot_tank,
-        step=0.25,
-        key="dispatch_spot_tank",
+    saved_dispatches = (
+        get_saved_dispatches()
+    )
+
+    if saved_dispatches:
+        saved_df = pd.DataFrame(
+            saved_dispatches
+        )
+
+        saved_columns = [
+            column
+            for column
+            in (
+                "id",
+                "dispatch_date",
+                "crew_name",
+                "route_number",
+                "status",
+                "stop_count",
+                "completed_count",
+            )
+            if column
+            in saved_df.columns
+        ]
+
+        st.dataframe(
+            saved_df[
+                saved_columns
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+        st.info(
+            "No saved crew dispatches yet."
+        )
+
+    st.divider()
+
+    st.subheader(
+        "Daily Load Sheet"
     )
 
     from core.load_sheet import (
@@ -1668,482 +1724,288 @@ with tab_dispatch:
         build_daily_load_sheet_html,
     )
 
-    load_sheet = build_daily_load_sheet(
-        scheduled_date=dispatch_date,
-        gallons_per_acre=load_gallons_per_acre,
-        tank_sizes=[
-            large_tank_size,
-            small_tank_size,
-        ],
-        spot_tank_size=spot_tank_size,
-    )
-
-    load_summary = load_sheet["summary"]
-
-    load_metric1, load_metric2, load_metric3 = st.columns(3)
-
-    load_metric1.metric(
-        "Scheduled Stops",
-        load_summary["stops"],
-    )
-
-    load_metric2.metric(
-        "Total Acres",
-        load_summary["acres"],
-    )
-
-    load_metric3.metric(
-        "Total Water",
-        f"{load_summary['water_gallons']} gal",
-    )
-
-    with st.expander(
-        "Treatment Mix Totals",
-        expanded=True,
+    if st.session_state.pop(
+        "reload_spray_defaults",
+        False,
     ):
-
-        if load_sheet["mix_summary"].empty:
-
-            st.info(
-                "No treatment loads are scheduled "
-                "for the selected date."
+        for widget_key in (
+            "dispatch_water_gpa",
+            "dispatch_large_tank",
+            "dispatch_small_tank",
+            "dispatch_spot_tank",
+        ):
+            st.session_state.pop(
+                widget_key,
+                None,
             )
 
-        else:
+    saved_water_gpa = (
+        load_float_setting(
+            "water_gallons_per_acre",
+            20.0,
+        )
+    )
 
-            st.dataframe(
-                load_sheet["mix_summary"],
-                use_container_width=True,
-                hide_index=True,
+    saved_large_tank = (
+        load_float_setting(
+            "large_tank_gallons",
+            200.0,
+        )
+    )
+
+    saved_small_tank = (
+        load_float_setting(
+            "small_tank_gallons",
+            30.0,
+        )
+    )
+
+    saved_spot_tank = (
+        load_float_setting(
+            "spot_tank_gallons",
+            1.0,
+        )
+    )
+
+    (
+        load_col1,
+        load_col2,
+        load_col3,
+        load_col4,
+    ) = st.columns(
+        4
+    )
+
+    load_gallons_per_acre = (
+        load_col1.number_input(
+            "Water Gallons Per Acre",
+            min_value=0.1,
+            value=saved_water_gpa,
+            step=1.0,
+            key="dispatch_water_gpa",
+        )
+    )
+
+    large_tank_size = (
+        load_col2.number_input(
+            "Large Tank Gallons",
+            min_value=1.0,
+            value=saved_large_tank,
+            step=5.0,
+            key="dispatch_large_tank",
+        )
+    )
+
+    small_tank_size = (
+        load_col3.number_input(
+            "Small Tank Gallons",
+            min_value=1.0,
+            value=saved_small_tank,
+            step=1.0,
+            key="dispatch_small_tank",
+        )
+    )
+
+    spot_tank_size = (
+        load_col4.number_input(
+            "Spot Treatment Gallons",
+            min_value=0.1,
+            value=saved_spot_tank,
+            step=0.25,
+            key="dispatch_spot_tank",
+        )
+    )
+
+    try:
+        load_sheet = (
+            build_daily_load_sheet(
+                scheduled_date=date.today(),
+                gallons_per_acre=(
+                    load_gallons_per_acre
+                ),
+                tank_sizes=[
+                    large_tank_size,
+                    small_tank_size,
+                ],
+                spot_tank_size=(
+                    spot_tank_size
+                ),
             )
-
-    with st.expander(
-        "Total Chemicals Needed",
-        expanded=True,
-    ):
-
-        if load_sheet["chemical_totals"].empty:
-
-            st.info(
-                "No chemicals are assigned to treatments "
-                "for the selected date."
-            )
-
-        else:
-
-            st.dataframe(
-                load_sheet["chemical_totals"],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    with st.expander(
-        "Granular Product Load",
-        expanded=True,
-    ):
-
-        granular_product_load = load_sheet.get(
-            "granular_product_load",
-            pd.DataFrame(),
         )
 
-        if granular_product_load.empty:
+    except Exception:
+        st.error(
+            "Daily load sheet could not be built."
+        )
+        st.exception(
+            traceback.format_exc()
+        )
+        load_sheet = None
 
-            st.info(
-                "No granular products are scheduled "
-                "for the selected date."
+    if load_sheet:
+        load_summary = (
+            load_sheet[
+                "summary"
+            ]
+        )
+
+        l1, l2, l3 = (
+            st.columns(
+                3
+            )
+        )
+
+        l1.metric(
+            "Scheduled Stops",
+            load_summary.get(
+                "stops",
+                0,
+            ),
+        )
+
+        l2.metric(
+            "Total Acres",
+            load_summary.get(
+                "acres",
+                0,
+            ),
+        )
+
+        l3.metric(
+            "Total Water",
+            f"{load_summary.get('water_gallons', 0)} gal",
+        )
+
+        for title, key in (
+            (
+                "Treatment Mix Totals",
+                "mix_summary",
+            ),
+            (
+                "Total Chemicals Needed",
+                "chemical_totals",
+            ),
+            (
+                "Tank Load Breakdown",
+                "tank_plan",
+            ),
+        ):
+            with st.expander(
+                title,
+                expanded=(
+                    title
+                    != "Tank Load Breakdown"
+                ),
+            ):
+                table = (
+                    load_sheet.get(
+                        key
+                    )
+                )
+
+                if (
+                    table is None
+                    or table.empty
+                ):
+                    st.info(
+                        "No data available."
+                    )
+                else:
+                    st.dataframe(
+                        table,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+        try:
+            load_sheet_html = (
+                build_daily_load_sheet_html(
+                    load_sheet=(
+                        load_sheet
+                    ),
+                    scheduled_date=date.today(),
+                    gallons_per_acre=(
+                        load_gallons_per_acre
+                    ),
+                    tank_sizes=[
+                        large_tank_size,
+                        small_tank_size,
+                    ],
+                    spot_tank_size=(
+                        spot_tank_size
+                    ),
+                )
+            )
+        except TypeError:
+            load_sheet_html = (
+                build_daily_load_sheet_html(
+                    load_sheet=(
+                        load_sheet
+                    ),
+                    scheduled_date=date.today(),
+                    gallons_per_acre=(
+                        load_gallons_per_acre
+                    ),
+                    tank_sizes=[
+                        large_tank_size,
+                        small_tank_size,
+                    ],
+                )
             )
 
-        else:
-
-            st.dataframe(
-                granular_product_load,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    with st.expander(
-        "Tank Load Breakdown",
-        expanded=True,
-    ):
-
-        if not load_sheet["tank_plan"].empty:
-
-            st.dataframe(
-                load_sheet["tank_plan"],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    load_sheet_html = build_daily_load_sheet_html(
-        load_sheet=load_sheet,
-        scheduled_date=dispatch_date,
-        gallons_per_acre=(
-            load_gallons_per_acre
-        ),
-        tank_sizes=[
-            large_tank_size,
-            small_tank_size,
-        ],
-        spot_tank_size=spot_tank_size,
-    )
-
-    export_col1, export_col2 = st.columns(2)
-
-    export_col1.download_button(
-        "Download Printable Load Sheet",
-        data=load_sheet_html,
-        file_name=(
-            f"daily_load_sheet_"
-            f"{dispatch_date.isoformat()}.html"
-        ),
-        mime="text/html",
-        use_container_width=True,
-    )
-
-    export_col2.download_button(
-        "Download Chemical Totals CSV",
-        data=load_sheet[
-            "chemical_totals"
-        ].to_csv(index=False),
-        file_name=(
-            f"chemical_totals_"
-            f"{dispatch_date.isoformat()}.csv"
-        ),
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    export_col3, export_col4 = st.columns(2)
-
-    export_col3.download_button(
-        "Download Tank Plan CSV",
-        data=load_sheet[
-            "tank_plan"
-        ].to_csv(index=False),
-        file_name=(
-            f"tank_plan_"
-            f"{dispatch_date.isoformat()}.csv"
-        ),
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    export_col4.download_button(
-        "Download Mix Summary CSV",
-        data=load_sheet[
-            "mix_summary"
-        ].to_csv(index=False),
-        file_name=(
-            f"mix_summary_"
-            f"{dispatch_date.isoformat()}.csv"
-        ),
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    st.download_button(
-        "Download Granular Product Load CSV",
-        data=load_sheet.get(
-            "granular_product_load",
-            pd.DataFrame(),
-        ).to_csv(index=False),
-        file_name=(
-            f"granular_product_load_"
-            f"{dispatch_date.isoformat()}.csv"
-        ),
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-
-    st.divider()
-
-
-    st.subheader("Optimized Route")
-
-    route_df = dispatch.get(
-        "dataframe",
-        pd.DataFrame(),
-    )
-
-    if not route_df.empty:
-
-        st.dataframe(
-            route_df,
+        st.download_button(
+            "Download Printable Load Sheet",
+            data=(
+                load_sheet_html
+            ),
+            file_name=(
+                "daily_load_sheet_"
+                f"{date.today().isoformat()}.html"
+            ),
+            mime="text/html",
             use_container_width=True,
-            hide_index=True,
         )
 
-    else:
-
-        st.info(
-            "No route has been generated."
-        )
-
-    st.divider()
-
-    summary = dispatch.get(
-        "summary",
-        {},
-    )
-
-    if summary:
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        with c1:
-
-            st.metric(
-                "Stops",
-                summary.get(
-                    "stops",
-                    0,
-                ),
-            )
-
-        with c2:
-
-            st.metric(
-                "Miles",
-                round(
-                    summary.get(
-                        "distance_miles",
-                        0,
-                    ),
-                    1,
-                ),
-            )
-
-        with c3:
-
-            st.metric(
-                "Drive",
-                round(
-                    summary.get(
-                        "drive_minutes",
-                        0,
-                    ),
-                    1,
-                ),
-            )
-
-        with c4:
-
-            st.metric(
-                "Total",
-                round(
-                    summary.get(
-                        "total_minutes",
-                        0,
-                    ),
-                    1,
-                ),
-            )
-
-        maps = summary.get(
-            "google_maps",
-            "",
-        )
-
-        if maps:
-
-            st.link_button(
-                "Open Route in Google Maps",
-                maps,
-                use_container_width=True,
-            )
-
-    st.divider()
-
-    st.subheader("Driver Manifest")
-
-    manifest = dispatch.get(
-        "manifest",
-        [],
-    )
-
-    if manifest:
-
-        st.dataframe(
-            pd.DataFrame(manifest),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    else:
-
-        st.info(
-            "No driver manifest available."
-        )
 
 # ==========================================================
-# ROUTE BUILDER
-# ==========================================================
-
-    st.subheader("Route Builder")
-
-    rb1, rb2, rb3, rb4 = st.columns(4)
-
-    build_route = rb1.button(
-        "🧩 Build Route",
-        use_container_width=True,
-    )
-
-    optimize_clusters = rb2.button(
-        "🏘️ Neighborhoods",
-        use_container_width=True,
-    )
-
-    balance_routes = rb3.button(
-        "⚖️ Balance Workload",
-        use_container_width=True,
-    )
-
-    save_route = rb4.button(
-        "💾 Save Route",
-        use_container_width=True,
-    )
-
-    if build_route:
-
-        st.success(
-            f"Building the route for "
-            f"{dispatch_date:%B %d, %Y}..."
-        )
-
-    if optimize_clusters:
-
-        st.info(
-            "Neighborhood clustering will be performed."
-        )
-
-    if balance_routes:
-
-        st.info(
-            "Balancing technician workload..."
-        )
-
-    if save_route:
-
-        st.success(
-            "Route saved."
-        )
-
-    st.divider()
-
-    st.subheader(
-        f"Route Statistics — "
-        f"{dispatch_date:%B %d, %Y}"
-    )
-
-    s1, s2, s3, s4 = st.columns(4)
-
-    s1.metric(
-        "Estimated Stops",
-        len(selected_jobs),
-    )
-
-    s2.metric(
-        "Drive Time",
-        "--",
-    )
-
-    s3.metric(
-        "Work Time",
-        "--",
-    )
-
-    s4.metric(
-        "Miles",
-        "--",
-    )
-    
-# ==========================================================
-# TREATMENTS TAB
-# ==========================================================
-
-with tab_treatments:
-
-    from tabs.treatments import (
-        render as render_treatments,
-    )
-
-    render_treatments()
-
-# ==========================================================
-# APPLICATIONS TAB
-# ==========================================================
-with tab_applications:
-
-    from tabs.applications import (
-        render as render_applications,
-    )
-
-    render_applications(
-        current_email=current_email
-    )
-    
-    
-# ==========================================================
-# INVOICING TAB
-# ==========================================================
-
-with tab_invoicing:
-
-    from tabs.invoicing import (
-        render as render_invoicing,
-    )
-
-    render_invoicing()
-
-# ==========================================================
-# SCHEDULING TAB
+# SCHEDULING
 # ==========================================================
 
 with tab_schedule:
-
-    st.header("Scheduling")
-
-    st.caption(
-        "Review customers by their last service date, "
-        "then add selected visits to dispatch."
+    st.header(
+        "Scheduling"
     )
 
-    schedule_dispatch_notice = st.session_state.pop(
+    st.caption(
+        "Schedule treatment visits. Once a visit is queued, "
+        "its scheduled date no longer prevents it from appearing in Dispatch."
+    )
+
+    notice = st.session_state.pop(
         "schedule_dispatch_notice",
         None,
     )
 
-    if schedule_dispatch_notice:
-
+    if notice:
         st.success(
-            f"Created "
-            f"{schedule_dispatch_notice['jobs_created']} "
-            f"dispatch stop(s) and linked "
-            f"{schedule_dispatch_notice['events_linked']} "
-            "treatment(s)."
+            f"Created {notice['jobs_created']} dispatch stop(s) "
+            f"and linked {notice['events_linked']} treatment(s)."
         )
 
-        if schedule_dispatch_notice["skipped"]:
-
+        if notice.get(
+            "skipped"
+        ):
             st.info(
-                f"Skipped "
-                f"{schedule_dispatch_notice['skipped']} "
-                "treatment(s) already in dispatch."
+                f"Skipped {notice['skipped']} treatment(s) "
+                "already in dispatch."
             )
 
-    schedule_date = st.date_input(
-        "Service Date",
-        key="schedule_service_date",
-    )
-
-    crew_count = st.number_input(
-        "Number of Crews",
-        min_value=1,
-        max_value=10,
-        value=1,
-        key="schedule_crew_count",
+    schedule_date = (
+        st.date_input(
+            "Service Date",
+            value=date.today(),
+            key="schedule_service_date",
+        )
     )
 
     from core.scheduling import (
@@ -2151,57 +2013,77 @@ with tab_schedule:
         queue_treatment_events_for_date,
     )
 
-    candidates = build_treatment_schedule_candidates(
-        schedule_date
+    candidates = (
+        build_treatment_schedule_candidates(
+            schedule_date
+        )
     )
 
-    due_count = len(candidates)
+    due_count = len(
+        candidates
+    )
 
     queued_count = sum(
-        bool(item["already_queued"])
+        bool(
+            item.get(
+                "already_queued"
+            )
+        )
         for item in candidates
     )
 
-    ready_count = due_count - queued_count
+    ready_count = (
+        due_count
+        - queued_count
+    )
 
-    m1, m2, m3 = st.columns(3)
+    s1, s2, s3 = (
+        st.columns(
+            3
+        )
+    )
 
-    m1.metric(
+    s1.metric(
         "Due by Date",
         due_count,
     )
 
-    m2.metric(
+    s2.metric(
         "Already Queued",
         queued_count,
     )
 
-    m3.metric(
+    s3.metric(
         "Ready to Schedule",
         ready_count,
     )
 
     if candidates:
-
-        schedule_rows = pd.DataFrame(
-            candidates
+        schedule_rows = (
+            pd.DataFrame(
+                candidates
+            )
         )
 
-        if "schedule_select_all" not in st.session_state:
-            st.session_state.schedule_select_all = False
-
-        if "schedule_editor_version" not in st.session_state:
-            st.session_state.schedule_editor_version = 0
-
-        select_col, deselect_col = st.columns(2)
+        select_col, deselect_col = (
+            st.columns(
+                2
+            )
+        )
 
         if select_col.button(
             "Select All",
             use_container_width=True,
             key="schedule_select_all_button",
         ):
-            st.session_state.schedule_select_all = True
-            st.session_state.schedule_editor_version += 1
+            st.session_state[
+                "schedule_select_all"
+            ] = True
+
+            st.session_state[
+                "schedule_editor_version"
+            ] += 1
+
             st.rerun()
 
         if deselect_col.button(
@@ -2209,13 +2091,23 @@ with tab_schedule:
             use_container_width=True,
             key="schedule_deselect_all_button",
         ):
-            st.session_state.schedule_select_all = False
-            st.session_state.schedule_editor_version += 1
+            st.session_state[
+                "schedule_select_all"
+            ] = False
+
+            st.session_state[
+                "schedule_editor_version"
+            ] += 1
+
             st.rerun()
 
         default_selection = (
-            ~schedule_rows["already_queued"]
-            if st.session_state.schedule_select_all
+            ~schedule_rows[
+                "already_queued"
+            ]
+            if st.session_state[
+                "schedule_select_all"
+            ]
             else False
         )
 
@@ -2225,8 +2117,12 @@ with tab_schedule:
             default_selection,
         )
 
-        schedule_rows["due_date"] = pd.to_datetime(
-            schedule_rows["due_date"],
+        schedule_rows[
+            "due_date"
+        ] = pd.to_datetime(
+            schedule_rows[
+                "due_date"
+            ],
             errors="coerce",
         ).dt.date
 
@@ -2243,60 +2139,74 @@ with tab_schedule:
             "already_queued",
         ]
 
-        edited_schedule = st.data_editor(
-            schedule_rows[display_columns],
-            use_container_width=True,
-            hide_index=True,
-            disabled=[
-                "event_id",
-                "name",
-                "treatment",
-                "event_type",
-                "due_date",
-                "days_overdue",
-                "address",
-                "override_reason",
-                "already_queued",
-            ],
-            column_config={
-                "Schedule": (
-                    st.column_config.CheckboxColumn(
-                        "Schedule"
-                    )
+        edited_schedule = (
+            st.data_editor(
+                schedule_rows[
+                    display_columns
+                ],
+                use_container_width=True,
+                hide_index=True,
+                disabled=[
+                    "event_id",
+                    "name",
+                    "treatment",
+                    "event_type",
+                    "due_date",
+                    "days_overdue",
+                    "address",
+                    "override_reason",
+                    "already_queued",
+                ],
+                column_config={
+                    "Schedule": (
+                        st.column_config.CheckboxColumn(
+                            "Schedule"
+                        )
+                    ),
+                    "event_id": None,
+                    "name": "Customer",
+                    "treatment": "Treatment",
+                    "event_type": "Type",
+                    "due_date": (
+                        st.column_config.DateColumn(
+                            "Due Date"
+                        )
+                    ),
+                    "days_overdue": (
+                        st.column_config.NumberColumn(
+                            "Days Overdue"
+                        )
+                    ),
+                    "address": "Address",
+                    "override_reason": "Weather/Override",
+                    "already_queued": (
+                        st.column_config.CheckboxColumn(
+                            "Queued"
+                        )
+                    ),
+                },
+                key=(
+                    "schedule_treatments_"
+                    f"{st.session_state['schedule_editor_version']}"
                 ),
-                "event_id": None,
-                "name": "Customer",
-                "treatment": "Treatment",
-                "event_type": "Type",
-                "due_date": (
-                    st.column_config.DateColumn(
-                        "Due Date"
-                    )
-                ),
-                "days_overdue": (
-                    st.column_config.NumberColumn(
-                        "Days Overdue"
-                    )
-                ),
-                "address": "Address",
-                "override_reason": "Weather/Override",
-                "already_queued": (
-                    st.column_config.CheckboxColumn(
-                        "Queued"
-                    )
-                ),
-            },
-            key=(
-                "schedule_treatments_"
-                f"{st.session_state.schedule_editor_version}"
-            ),
+            )
         )
 
-        selected_event_ids = edited_schedule.loc[
-            edited_schedule["Schedule"]
-            & ~edited_schedule["already_queued"],
-            "event_id",
-        ].tolist()
+        selected_event_ids = (
+            edited_schedule.loc[
+                edited_schedule[
+                    "Schedule"
+                ]
+                & ~edited_schedule[
+                    "already_queued"
+                ],
+                "event_id",
+            ]
+            .astype(
+                int
+            )
+            .tolist()
+        )
 
         if st.button(
             (
@@ -2305,30 +2215,36 @@ with tab_schedule:
             ),
             type="primary",
             use_container_width=True,
-            disabled=not selected_event_ids,
+            disabled=(
+                not selected_event_ids
+            ),
             key="schedule_add_dispatch",
         ):
-
-            result = queue_treatment_events_for_date(
-                selected_event_ids,
-                schedule_date,
+            result = (
+                queue_treatment_events_for_date(
+                    selected_event_ids,
+                    schedule_date,
+                )
             )
 
-            st.session_state.schedule_dispatch_notice = (
-                result
-            )
+            st.session_state[
+                "schedule_dispatch_notice"
+            ] = result
 
-            st.session_state.schedule_select_all = False
-            st.session_state.schedule_editor_version += 1
+            st.session_state[
+                "schedule_select_all"
+            ] = False
+
+            st.session_state[
+                "schedule_editor_version"
+            ] += 1
 
             st.rerun()
 
     else:
-
         st.info(
             "No planned treatments are due by this date. "
-            "Generate the seasonal schedule from the "
-            "Treatments tab first."
+            "Generate the seasonal schedule from Treatments first."
         )
 
     st.divider()
@@ -2337,140 +2253,219 @@ with tab_schedule:
         "Crew Route Preview"
     )
 
-    if st.button(
-        "Preview Routes for Queued Jobs",
-        use_container_width=True,
-        key="schedule_route_preview",
+    st.caption(
+        "This preview uses the entire queued Dispatch pool, "
+        "including jobs scheduled for other dates."
+    )
+
+    preview_crews = (
+        get_crews(
+            active_only=True
+        )
+    )
+
+    if (
+        preview_crews is None
+        or preview_crews.empty
     ):
-
-        try:
-
-            from ui.dispatch import (
-                build_multi_driver_routes,
+        st.info(
+            "Add active crews in Settings before previewing multi-crew routes."
+        )
+    else:
+        preview_crew_labels = {
+            int(
+                row[
+                    "id"
+                ]
+            ): safe_text(
+                row.get(
+                    "crew_name"
+                )
             )
+            for _, row in preview_crews.iterrows()
+        }
 
-            routes = build_multi_driver_routes(
-                crews=int(crew_count),
-                scheduled_date=schedule_date,
+        preview_selected_ids = (
+            st.multiselect(
+                "Preview Crews",
+                options=list(
+                    preview_crew_labels
+                ),
+                default=list(
+                    preview_crew_labels
+                ),
+                format_func=lambda value: (
+                    preview_crew_labels[
+                        value
+                    ]
+                ),
+                key="schedule_preview_crews",
             )
+        )
 
-            if routes:
-
-                for crew in routes:
-
-                    st.subheader(
-                        f"Crew {crew['crew']}"
-                    )
-
-                    crew_summary = crew.get(
-                        "summary",
-                        {},
-                    )
-
-                    preview_1, preview_2, preview_3, preview_4 = (
-                        st.columns(4)
-                    )
-
-                    preview_1.metric(
-                        "Stops",
-                        int(
-                            crew_summary.get(
-                                "stops",
-                                0,
-                            )
-                        ),
-                    )
-
-                    preview_2.metric(
-                        "Distance",
-                        (
-                            f"{float(crew_summary.get(
-                                'distance_miles',
-                                0,
-                            )):.1f} mi"
-                        ),
-                    )
-
-                    preview_3.metric(
-                        "Drive Time",
-                        (
-                            f"{float(crew_summary.get(
-                                'drive_minutes',
-                                0,
-                            )):.0f} min"
-                        ),
-                    )
-
-                    preview_4.metric(
-                        "Total Time",
-                        (
-                            f"{float(crew_summary.get(
-                                'total_minutes',
-                                0,
-                            )):.0f} min"
-                        ),
-                    )
-
-                    google_maps = crew_summary.get(
-                        "google_maps",
-                        "",
-                    )
-
-                    if google_maps:
-
-                        st.link_button(
-                            (
-                                f"Open Crew {crew['crew']} "
-                                "Route in Google Maps"
-                            ),
-                            google_maps,
-                            use_container_width=True,
+        if st.button(
+            "Preview Routes for Queued Jobs",
+            use_container_width=True,
+            key="schedule_route_preview",
+            disabled=(
+                not preview_selected_ids
+            ),
+        ):
+            try:
+                selected = (
+                    preview_crews[
+                        preview_crews[
+                            "id"
+                        ]
+                        .astype(
+                            int
                         )
-
-                    st.dataframe(
-                        pd.DataFrame(
-                            crew["manifest"]
-                        ),
-                        use_container_width=True,
-                        hide_index=True,
+                        .isin(
+                            preview_selected_ids
+                        )
+                    ]
+                    .to_dict(
+                        "records"
                     )
-
-            else:
-
-                st.warning(
-                    "No queued jobs found."
                 )
 
-        except Exception:
+                routes = (
+                    build_multi_driver_routes(
+                        crews=selected,
+                    )
+                )
 
-            st.exception(
-                traceback.format_exc()
-            )
+                if routes:
+                    for crew_route in routes:
+                        st.markdown(
+                            f"### {crew_route['crew']}"
+                        )
 
-            
+                        crew_summary = (
+                            crew_route.get(
+                                "summary",
+                                {},
+                            )
+                        )
+
+                        preview_1, preview_2, preview_3, preview_4 = (
+                            st.columns(
+                                4
+                            )
+                        )
+
+                        preview_1.metric(
+                            "Stops",
+                            int(
+                                crew_summary.get(
+                                    "stops",
+                                    0,
+                                )
+                            ),
+                        )
+
+                        preview_2.metric(
+                            "Distance",
+                            f"{safe_float(crew_summary.get('distance_miles')):.1f} mi",
+                        )
+
+                        preview_3.metric(
+                            "Drive Time",
+                            f"{safe_float(crew_summary.get('drive_minutes')):.0f} min",
+                        )
+
+                        preview_4.metric(
+                            "Total Time",
+                            f"{safe_float(crew_summary.get('total_minutes')):.0f} min",
+                        )
+
+                        maps = (
+                            crew_route.get(
+                                "google_maps"
+                            )
+                            or crew_summary.get(
+                                "google_maps"
+                            )
+                        )
+
+                        if maps:
+                            st.link_button(
+                                f"Open {crew_route['crew']} Route in Google Maps",
+                                maps,
+                                use_container_width=True,
+                            )
+
+                        st.dataframe(
+                            pd.DataFrame(
+                                crew_route[
+                                    "manifest"
+                                ]
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                else:
+                    st.warning(
+                        "No queued jobs found."
+                    )
+
+            except Exception:
+                st.exception(
+                    traceback.format_exc()
+                )
+
+
 # ==========================================================
-# ROUTING TAB
+# TREATMENTS
+# ==========================================================
+
+with tab_treatments:
+    from tabs.treatments import (
+        render as render_treatments,
+    )
+
+    render_treatments()
+
+
+# ==========================================================
+# APPLICATIONS
+# ==========================================================
+
+with tab_applications:
+    from tabs.applications import (
+        render as render_applications,
+    )
+
+    render_applications(
+        current_email=current_email
+    )
+
+
+# ==========================================================
+# INVOICING
+# ==========================================================
+
+with tab_invoicing:
+    from tabs.invoicing import (
+        render as render_invoicing,
+    )
+
+    render_invoicing()
+
+
+# ==========================================================
+# ROUTING
 # ==========================================================
 
 with tab_routes:
-
-    st.header("Routing")
-
-    st.write(
-        "Generate and analyze optimized routes."
+    st.header(
+        "Routing"
     )
 
-    if st.button(
-        "Generate Route",
-        use_container_width=True,
-        key="route_generate",
-    ):
-
-        dispatch = dispatch_dashboard()
-
-        st.success(
-            "Route generated successfully."
-        )
+    st.caption(
+        "This view analyzes the current complete Dispatch-ready queue."
+    )
 
     route_df = dispatch.get(
         "dataframe",
@@ -2478,17 +2473,14 @@ with tab_routes:
     )
 
     if not route_df.empty:
-
         st.dataframe(
             route_df,
             use_container_width=True,
             hide_index=True,
         )
-
     else:
-
         st.info(
-            "No optimized route available."
+            "No optimized route is available."
         )
 
     summary = dispatch.get(
@@ -2497,67 +2489,44 @@ with tab_routes:
     )
 
     if summary:
-
         st.divider()
 
-        c1, c2, c3, c4 = st.columns(4)
-
-        with c1:
-
-            st.metric(
-                "Stops",
-                summary.get(
-                    "stops",
-                    0,
-                ),
+        r1, r2, r3, r4 = (
+            st.columns(
+                4
             )
+        )
 
-        with c2:
+        r1.metric(
+            "Stops",
+            summary.get(
+                "stops",
+                0,
+            ),
+        )
 
-            st.metric(
-                "Miles",
-                round(
-                    summary.get(
-                        "distance_miles",
-                        0,
-                    ),
-                    1,
-                ),
+        r2.metric(
+            "Miles",
+            f"{safe_float(summary.get('distance_miles')):.1f}",
+        )
+
+        r3.metric(
+            "Drive Minutes",
+            f"{safe_float(summary.get('drive_minutes')):.0f}",
+        )
+
+        r4.metric(
+            "Total Minutes",
+            f"{safe_float(summary.get('total_minutes')):.0f}",
+        )
+
+        maps = safe_text(
+            summary.get(
+                "google_maps"
             )
-
-        with c3:
-
-            st.metric(
-                "Drive Minutes",
-                round(
-                    summary.get(
-                        "drive_minutes",
-                        0,
-                    ),
-                    1,
-                ),
-            )
-
-        with c4:
-
-            st.metric(
-                "Total Minutes",
-                round(
-                    summary.get(
-                        "total_minutes",
-                        0,
-                    ),
-                    1,
-                ),
-            )
-
-        maps = summary.get(
-            "google_maps",
-            "",
         )
 
         if maps:
-
             st.link_button(
                 "Open in Google Maps",
                 maps,
@@ -2566,20 +2535,19 @@ with tab_routes:
 
 
 # ==========================================================
-# REPORTS TAB
+# REPORTS
 # ==========================================================
 
 with tab_reports:
-
-    from datetime import date
-
     from core.compliance_reports import (
         build_inspector_html,
         build_route_html,
         get_application_report,
     )
 
-    st.header("Reports")
+    st.header(
+        "Reports"
+    )
 
     (
         route_report_tab,
@@ -2591,51 +2559,53 @@ with tab_reports:
         ]
     )
 
-    # ======================================================
-    # DAILY ROUTE REPORT
-    # ======================================================
-
     with route_report_tab:
-
-        st.subheader("Current Daily Route")
+        st.subheader(
+            "Current Daily Route"
+        )
 
         current_route = dispatch.get(
             "route",
             [],
         )
 
-        route_summary_data = dispatch.get(
-            "summary",
-            {},
+        route_summary_data = (
+            dispatch.get(
+                "summary",
+                {},
+            )
         )
 
-        route_report_date = st.date_input(
-            "Route Date",
-            value=date.today(),
-            key="route_report_date",
+        route_report_date = (
+            st.date_input(
+                "Route Date",
+                value=date.today(),
+                key="route_report_date",
+            )
         )
 
-        route_report_html = build_route_html(
-            current_route,
-            route_summary_data,
-            route_report_date,
+        route_report_html = (
+            build_route_html(
+                current_route,
+                route_summary_data,
+                route_report_date,
+            )
         )
 
-        route_df = dispatch.get(
-            "dataframe",
-            pd.DataFrame(),
+        report_route_df = (
+            dispatch.get(
+                "dataframe",
+                pd.DataFrame(),
+            )
         )
 
-        if route_df.empty:
-
+        if report_route_df.empty:
             st.info(
                 "No current route is available."
             )
-
         else:
-
             st.dataframe(
-                route_df,
+                report_route_df,
                 use_container_width=True,
                 hide_index=True,
             )
@@ -2650,76 +2620,76 @@ with tab_reports:
             use_container_width=True,
         )
 
-        st.caption(
-            "Open the downloaded file and click Print Report."
-        )
-
-    # ======================================================
-    # INSPECTOR REPORT
-    # ======================================================
-
     with inspector_report_tab:
-
         st.subheader(
             "Pesticide Application Report"
         )
 
         today = date.today()
 
-        default_start = today.replace(
-            day=1
+        default_start = (
+            today.replace(
+                day=1
+            )
         )
 
-        range_col1, range_col2 = st.columns(2)
-
-        report_start = range_col1.date_input(
-            "Start Application Date",
-            value=default_start,
-            key="inspector_start_date",
+        range_col1, range_col2 = (
+            st.columns(
+                2
+            )
         )
 
-        report_end = range_col2.date_input(
-            "End Application Date",
-            value=today,
-            key="inspector_end_date",
+        report_start = (
+            range_col1.date_input(
+                "Start Application Date",
+                value=default_start,
+                key="inspector_start_date",
+            )
+        )
+
+        report_end = (
+            range_col2.date_input(
+                "End Application Date",
+                value=today,
+                key="inspector_end_date",
+            )
         )
 
         if report_start > report_end:
-
             st.error(
                 "Start date must be before the end date."
             )
-
         else:
-
-            inspector_report = get_application_report(
-                report_start,
-                report_end,
+            inspector_report = (
+                get_application_report(
+                    report_start,
+                    report_end,
+                )
             )
 
             if inspector_report.empty:
-
                 st.info(
-                    "No chemical applications were recorded "
-                    "during this period."
+                    "No chemical applications were recorded during this period."
                 )
-
             else:
-
-                application_count = inspector_report[
-                    "Application ID"
-                ].nunique()
-
-                metric_col1, metric_col2 = st.columns(2)
-
-                metric_col1.metric(
-                    "Applications",
-                    application_count,
+                report_1, report_2 = (
+                    st.columns(
+                        2
+                    )
                 )
 
-                metric_col2.metric(
+                report_1.metric(
+                    "Applications",
+                    inspector_report[
+                        "Application ID"
+                    ].nunique(),
+                )
+
+                report_2.metric(
                     "Chemical Records",
-                    len(inspector_report),
+                    len(
+                        inspector_report
+                    ),
                 )
 
                 st.dataframe(
@@ -2728,17 +2698,17 @@ with tab_reports:
                     hide_index=True,
                 )
 
-            inspector_html = build_inspector_html(
-                inspector_report,
-                report_start,
-                report_end,
+            inspector_html = (
+                build_inspector_html(
+                    inspector_report,
+                    report_start,
+                    report_end,
+                )
             )
 
             st.subheader(
                 "Printable Report Preview"
             )
-
-            import streamlit.components.v1 as components
 
             components.html(
                 inspector_html,
@@ -2746,15 +2716,23 @@ with tab_reports:
                 scrolling=True,
             )
 
-            csv_data = inspector_report.to_csv(
-                index=False
+            csv_data = (
+                inspector_report.to_csv(
+                    index=False
+                )
             )
 
-            download_col1, download_col2 = st.columns(2)
+            report_download_1, report_download_2 = (
+                st.columns(
+                    2
+                )
+            )
 
-            download_col1.download_button(
+            report_download_1.download_button(
                 "Download Printable Report",
-                data=inspector_html,
+                data=(
+                    inspector_html
+                ),
                 file_name=(
                     "pesticide_application_report_"
                     f"{report_start}_{report_end}.html"
@@ -2763,7 +2741,7 @@ with tab_reports:
                 use_container_width=True,
             )
 
-            download_col2.download_button(
+            report_download_2.download_button(
                 "Download Inspector CSV",
                 data=csv_data,
                 file_name=(
@@ -2774,21 +2752,27 @@ with tab_reports:
                 use_container_width=True,
             )
 
+
 # ==========================================================
-# IMPORT DATA TAB
+# IMPORT
 # ==========================================================
 
 with tab_import:
-
     render_import_data()
 
+
 # ==========================================================
-# SETTINGS TAB
+# SETTINGS
 # ==========================================================
 
 with tab_settings:
+    st.header(
+        "Settings"
+    )
 
-    st.subheader("Database")
+    st.subheader(
+        "Database"
+    )
 
     st.success(
         "Connected to persistent Supabase PostgreSQL storage."
@@ -2800,12 +2784,9 @@ with tab_settings:
     )
 
     st.divider()
-    
-    st.header("Settings")
 
-    from core.crm import (
-        get_depot,
-        update_depot,
+    st.subheader(
+        "Depot"
     )
 
     depot = get_depot()
@@ -2813,75 +2794,68 @@ with tab_settings:
     with st.form(
         "depot_form"
     ):
-
-        depot_name = st.text_input(
-
-            "Depot Name",
-
-            depot.get(
-                "name",
-                "",
-            ),
+        depot_name = (
+            st.text_input(
+                "Depot Name",
+                value=safe_text(
+                    depot.get(
+                        "name"
+                    )
+                ),
+            )
         )
 
-        depot_address = st.text_input(
-
-            "Depot Address",
-
-            depot.get(
-                "address",
-                "",
-            ),
+        depot_address = (
+            st.text_input(
+                "Depot Address",
+                value=safe_text(
+                    depot.get(
+                        "address"
+                    )
+                ),
+            )
         )
 
-        depot_lat = st.number_input(
-
-            "Latitude",
-
-            value=float(
-                depot.get(
-                    "lat",
+        depot_lat = (
+            st.number_input(
+                "Latitude",
+                value=safe_float(
+                    depot.get(
+                        "lat"
+                    ),
                     32.2737,
-                )
-                or 32.2737
-            ),
-
-            format="%.6f",
-
+                ),
+                format="%.6f",
+            )
         )
 
-        depot_lng = st.number_input(
-
-            "Longitude",
-
-            value=float(
-                depot.get(
-                    "lng",
+        depot_lng = (
+            st.number_input(
+                "Longitude",
+                value=safe_float(
+                    depot.get(
+                        "lng"
+                    ),
                     -89.9865,
-                )
-                or -89.9865
-            ),
-
-            format="%.6f",
-
+                ),
+                format="%.6f",
+            )
         )
 
-        save = st.form_submit_button(
-            "Save Depot Settings"
+        save_depot = (
+            st.form_submit_button(
+                "Save Depot Settings",
+                type="primary",
+                use_container_width=True,
+            )
         )
 
-        if save:
-
+        if save_depot:
             update_depot(
-
                 depot_name,
-
                 depot_address,
-
                 depot_lat,
-
                 depot_lng,
-
             )
 
             st.success(
@@ -2893,103 +2867,398 @@ with tab_settings:
     st.divider()
 
     st.subheader(
+        "Crews"
+    )
+
+    crew_df = get_crews(
+        active_only=False
+    )
+
+    if (
+        crew_df is not None
+        and not crew_df.empty
+    ):
+        st.dataframe(
+            crew_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "id": None,
+                "crew_name": "Crew",
+                "email": "Email",
+                "phone": "Phone",
+                "active": "Active",
+                "notes": "Notes",
+            },
+        )
+
+    crew_edit_tab, crew_add_tab = (
+        st.tabs(
+            [
+                "Edit Crew",
+                "Add Crew",
+            ]
+        )
+    )
+
+    with crew_edit_tab:
+        if (
+            crew_df is None
+            or crew_df.empty
+        ):
+            st.info(
+                "No crews have been created."
+            )
+        else:
+            crew_labels = {
+                int(
+                    row[
+                        "id"
+                    ]
+                ): safe_text(
+                    row.get(
+                        "crew_name"
+                    )
+                )
+                for _, row
+                in crew_df.iterrows()
+            }
+
+            edit_crew_id = (
+                st.selectbox(
+                    "Crew",
+                    options=list(
+                        crew_labels
+                    ),
+                    format_func=lambda value: (
+                        crew_labels[
+                            value
+                        ]
+                    ),
+                    key="settings_edit_crew",
+                )
+            )
+
+            selected_crew = (
+                crew_df[
+                    crew_df[
+                        "id"
+                    ]
+                    .astype(
+                        int
+                    )
+                    == int(
+                        edit_crew_id
+                    )
+                ]
+                .iloc[0]
+            )
+
+            with st.form(
+                "edit_crew_form"
+            ):
+                edit_crew_name = (
+                    st.text_input(
+                        "Crew Name",
+                        value=safe_text(
+                            selected_crew.get(
+                                "crew_name"
+                            )
+                        ),
+                    )
+                )
+
+                edit_crew_email = (
+                    st.text_input(
+                        "Crew Email",
+                        value=safe_text(
+                            selected_crew.get(
+                                "email"
+                            )
+                        ),
+                    )
+                )
+
+                edit_crew_phone = (
+                    st.text_input(
+                        "Crew Phone",
+                        value=safe_text(
+                            selected_crew.get(
+                                "phone"
+                            )
+                        ),
+                    )
+                )
+
+                edit_crew_notes = (
+                    st.text_area(
+                        "Notes",
+                        value=safe_text(
+                            selected_crew.get(
+                                "notes"
+                            )
+                        ),
+                    )
+                )
+
+                edit_crew_active = (
+                    st.checkbox(
+                        "Active Crew",
+                        value=bool(
+                            selected_crew.get(
+                                "active",
+                                1,
+                            )
+                        ),
+                    )
+                )
+
+                save_crew = (
+                    st.form_submit_button(
+                        "Save Crew",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                )
+
+                if save_crew:
+                    update_crew(
+                        int(
+                            edit_crew_id
+                        ),
+                        crew_name=(
+                            edit_crew_name.strip()
+                        ),
+                        email=(
+                            edit_crew_email.strip()
+                            or None
+                        ),
+                        phone=(
+                            edit_crew_phone.strip()
+                            or None
+                        ),
+                        notes=(
+                            edit_crew_notes.strip()
+                            or None
+                        ),
+                        active=(
+                            edit_crew_active
+                        ),
+                    )
+
+                    st.success(
+                        "Crew updated."
+                    )
+
+                    st.rerun()
+
+    with crew_add_tab:
+        with st.form(
+            "add_crew_form"
+        ):
+            new_crew_name = (
+                st.text_input(
+                    "Crew Name"
+                )
+            )
+
+            new_crew_email = (
+                st.text_input(
+                    "Crew Email"
+                )
+            )
+
+            new_crew_phone = (
+                st.text_input(
+                    "Crew Phone"
+                )
+            )
+
+            new_crew_notes = (
+                st.text_area(
+                    "Notes"
+                )
+            )
+
+            add_crew_button = (
+                st.form_submit_button(
+                    "Add Crew",
+                    type="primary",
+                    use_container_width=True,
+                )
+            )
+
+            if add_crew_button:
+                if not new_crew_name.strip():
+                    st.error(
+                        "Crew name is required."
+                    )
+                else:
+                    try:
+                        create_crew(
+                            crew_name=(
+                                new_crew_name.strip()
+                            ),
+                            email=(
+                                new_crew_email.strip()
+                                or None
+                            ),
+                            phone=(
+                                new_crew_phone.strip()
+                                or None
+                            ),
+                            notes=(
+                                new_crew_notes.strip()
+                                or None
+                            ),
+                            active=True,
+                        )
+                    except Exception as exc:
+                        st.error(
+                            f"Crew could not be added: {exc}"
+                        )
+                    else:
+                        st.success(
+                            "Crew added."
+                        )
+                        st.rerun()
+
+    st.divider()
+
+    st.subheader(
         "Spray and Tank Defaults"
     )
-
-    from data.database import (
-        get_setting,
-        set_setting,
-    )
-
-    def settings_float(
-        setting_key,
-        fallback,
-    ):
-        try:
-            return float(
-                get_setting(
-                    setting_key,
-                    str(fallback),
-                )
-                or fallback
-            )
-        except (TypeError, ValueError):
-            return float(fallback)
 
     with st.form(
         "spray_defaults_form"
     ):
-
-        settings_col1, settings_col2 = st.columns(2)
-
-        default_water_gpa = settings_col1.number_input(
-            "Default Water Gallons Per Acre",
-            min_value=0.1,
-            value=settings_float(
-                "water_gallons_per_acre",
-                20.0,
-            ),
-            step=1.0,
+        settings_col1, settings_col2 = (
+            st.columns(
+                2
+            )
         )
 
-        default_large_tank = settings_col2.number_input(
-            "Large Broadcast Tank Gallons",
-            min_value=1.0,
-            value=settings_float(
-                "large_tank_gallons",
-                200.0,
-            ),
-            step=5.0,
+        default_water_gpa = (
+            settings_col1.number_input(
+                "Default Water Gallons Per Acre",
+                min_value=0.1,
+                value=load_float_setting(
+                    "water_gallons_per_acre",
+                    20.0,
+                ),
+                step=1.0,
+            )
         )
 
-        settings_col3, settings_col4 = st.columns(2)
-
-        default_small_tank = settings_col3.number_input(
-            "Small Broadcast Tank Gallons",
-            min_value=1.0,
-            value=settings_float(
-                "small_tank_gallons",
-                30.0,
-            ),
-            step=1.0,
+        default_large_tank = (
+            settings_col2.number_input(
+                "Large Broadcast Tank Gallons",
+                min_value=1.0,
+                value=load_float_setting(
+                    "large_tank_gallons",
+                    200.0,
+                ),
+                step=5.0,
+            )
         )
 
-        default_spot_tank = settings_col4.number_input(
-            "Spot Treatment Batch Gallons",
-            min_value=0.1,
-            value=settings_float(
-                "spot_tank_gallons",
-                1.0,
-            ),
-            step=0.25,
+        settings_col3, settings_col4 = (
+            st.columns(
+                2
+            )
         )
 
-        save_spray_defaults = st.form_submit_button(
-            "Save Spray and Tank Defaults",
-            type="primary",
-            use_container_width=True,
+        default_small_tank = (
+            settings_col3.number_input(
+                "Small Broadcast Tank Gallons",
+                min_value=1.0,
+                value=load_float_setting(
+                    "small_tank_gallons",
+                    30.0,
+                ),
+                step=1.0,
+            )
+        )
+
+        default_spot_tank = (
+            settings_col4.number_input(
+                "Spot Treatment Batch Gallons",
+                min_value=0.1,
+                value=load_float_setting(
+                    "spot_tank_gallons",
+                    1.0,
+                ),
+                step=0.25,
+            )
+        )
+
+        default_max_stops = (
+            st.number_input(
+                "Default Maximum Stops per Crew Route",
+                min_value=1,
+                max_value=50,
+                value=int(
+                    load_float_setting(
+                        "max_stops_per_route",
+                        10,
+                    )
+                ),
+                step=1,
+            )
+        )
+
+        save_spray_defaults = (
+            st.form_submit_button(
+                "Save Operational Defaults",
+                type="primary",
+                use_container_width=True,
+            )
         )
 
         if save_spray_defaults:
-
             set_setting(
                 "water_gallons_per_acre",
-                str(float(default_water_gpa)),
+                str(
+                    float(
+                        default_water_gpa
+                    )
+                ),
             )
 
             set_setting(
                 "large_tank_gallons",
-                str(float(default_large_tank)),
+                str(
+                    float(
+                        default_large_tank
+                    )
+                ),
             )
 
             set_setting(
                 "small_tank_gallons",
-                str(float(default_small_tank)),
+                str(
+                    float(
+                        default_small_tank
+                    )
+                ),
             )
 
             set_setting(
                 "spot_tank_gallons",
-                str(float(default_spot_tank)),
+                str(
+                    float(
+                        default_spot_tank
+                    )
+                ),
+            )
+
+            set_setting(
+                "max_stops_per_route",
+                str(
+                    int(
+                        default_max_stops
+                    )
+                ),
             )
 
             st.session_state[
@@ -2997,48 +3266,13 @@ with tab_settings:
             ] = True
 
             st.success(
-                "Spray and tank defaults saved."
+                "Operational defaults saved."
             )
 
             st.rerun()
 
     st.caption(
-        "Liquid Broadcast treatments use lawn acreage and "
-        "water gallons per acre. Spot treatments use one "
-        "saved batch per scheduled customer. Granular "
+        "Liquid Broadcast treatments use lawn acreage and water gallons "
+        "per acre. Spot treatments use a saved liquid batch. Granular "
         "Broadcast treatments use acreage without water."
     )
-
-    st.divider()
-
-    st.subheader(
-        "System Status"
-    )
-
-    try:
-
-        from data.database import (
-            database_health,
-        )
-
-        st.json(
-            database_health()
-        )
-
-    except Exception:
-
-        st.exception(
-            traceback.format_exc()
-        )
-
-
-# ==========================================================
-# FOOTER
-# ==========================================================
-
-st.divider()
-
-st.caption(
-    "Time Out Lawncare CRM • Version 2.0"
-)
-
