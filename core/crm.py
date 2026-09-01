@@ -190,13 +190,14 @@ def create_customer(
     cluster_id: int = 0,
     distance_from_cluster: float = 0,
     last_service: Optional[str] = None,
+    standard_schedule: bool = True,
     geocode: bool = True,
 ) -> Any:
     """
     Create a customer using either a full address or separate address fields.
 
-    Customer Type is stored on the customer and does not alter scheduling or
-    routing behavior.
+    Customer Type is stored on the customer and does not alter routing.
+    Standard Schedule enrollment defaults ON for new customers.
     """
     clean_name = str(
         name
@@ -340,6 +341,11 @@ def create_customer(
             )
         ),
         last_service=last_service,
+        standard_schedule=int(
+            bool(
+                standard_schedule
+            )
+        ),
     )
 
 

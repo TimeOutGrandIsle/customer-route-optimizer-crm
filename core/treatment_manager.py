@@ -596,7 +596,36 @@ def replace_treatment_products(
 
 def generate_standard_events(
     year: int,
+    start_after: date | str | None = None,
 ) -> Dict[str, int]:
+    """
+    Create Standard Schedule events for active, enrolled customers.
+
+    Rules:
+    - Only active customers with standard_schedule enabled are included.
+    - For the current year, events must occur strictly AFTER today unless
+      another start_after date is supplied.
+    - For a future year, the full year's Standard Schedule is eligible.
+    - Existing events are never duplicated.
+    - Past years are never backfilled.
+    """
+    target_year = int(year)
+    today = date.today()
+
+    if target_year < today.year:
+        return {
+            "created": 0,
+            "skipped": 0,
+            "past_skipped": 0,
+        }
+
+    if start_after is None:
+        cutoff = today if target_year == today.year else None
+    else:
+        cutoff = pd.to_datetime(
+            start_after
+        ).date()
+
     treatments = get_treatment_definitions(
         active_only=True
     )
@@ -607,54 +636,99 @@ def generate_standard_events(
 
     customers = dataframe(
         """
-        SELECT id
+        SELECT
+            id
         FROM customers
         WHERE active=1
+          AND COALESCE(standard_schedule, 1)=1
         """
     )
 
     created = 0
     skipped = 0
+    past_skipped = 0
 
     for _, customer in customers.iterrows():
+        customer_id = int(
+            customer["id"]
+        )
+
         for _, treatment in treatments.iterrows():
-            due = date(
-                int(year),
+            due_date = date(
+                target_year,
                 int(treatment["target_month"]),
                 int(treatment["target_day"]),
-            ).isoformat()
+            )
 
-            try:
-                execute(
-                    """
-                    INSERT INTO treatment_events (
-                        customer_id,
-                        treatment_id,
-                        due_date,
-                        status,
-                        event_type
-                    )
-                    VALUES (?, ?, ?, 'planned', 'standard')
-                    """,
-                    (
-                        int(customer["id"]),
-                        int(treatment["id"]),
-                        due,
-                    ),
+            if cutoff is not None and due_date <= cutoff:
+                past_skipped += 1
+                continue
+
+            due = due_date.isoformat()
+            treatment_id = int(
+                treatment["id"]
+            )
+
+            existing = dataframe(
+                """
+                SELECT id
+                FROM treatment_events
+                WHERE customer_id=?
+                  AND treatment_id=?
+                  AND due_date=?
+                LIMIT 1
+                """,
+                (
+                    customer_id,
+                    treatment_id,
+                    due,
+                ),
+            )
+
+            if not existing.empty:
+                skipped += 1
+                continue
+
+            execute(
+                """
+                INSERT INTO treatment_events (
+                    customer_id,
+                    treatment_id,
+                    due_date,
+                    status,
+                    event_type
                 )
+                VALUES (?, ?, ?, 'planned', 'standard')
+                """,
+                (
+                    customer_id,
+                    treatment_id,
+                    due,
+                ),
+            )
 
-                created += 1
-
-            except Exception as ex:
-                if "UNIQUE constraint failed" in str(ex):
-                    skipped += 1
-                else:
-                    raise
+            created += 1
 
     return {
         "created": created,
         "skipped": skipped,
+        "past_skipped": past_skipped,
     }
+
+
+def ensure_current_year_standard_events() -> Dict[str, int]:
+    """
+    Keep the current year's Standard Schedule populated automatically.
+
+    Because generate_standard_events() is duplicate-safe and future-only for
+    the current year, this can safely run whenever the CRM starts. This also
+    handles new customers and customers reactivated during the year: only
+    Standard Schedule treatments occurring after the current date are added.
+    """
+    return generate_standard_events(
+        date.today().year,
+        start_after=date.today(),
+    )
 
 
 def add_customer_treatment(
@@ -721,6 +795,11 @@ def get_treatment_events(
     if not include_completed:
         sql += """
             WHERE te.status='planned'
+              AND c.active=1
+              AND (
+                    te.event_type <> 'standard'
+                    OR COALESCE(c.standard_schedule, 1)=1
+                  )
         """
 
     sql += """
@@ -1253,3 +1332,4 @@ def calculate_mixture(
 
 
 initialize_treatment_system()
+ensure_current_year_standard_events()

@@ -37,6 +37,10 @@ from data.database import (
     mark_job_completed,
 )
 
+from core.invoicing import (
+    create_invoice_for_completed_dispatch_job,
+)
+
 from services.routing import build_navigation_url
 
 from ui.dispatch import (
@@ -521,15 +525,34 @@ def mark_arrived(
 
 def mark_completed(
     job_id: int,
-) -> None:
+) -> dict:
     """
-    Record service completion for a stop.
+    Record service completion for a stop, then create the related invoice.
+
+    Dispatch completion is committed first. Invoicing is intentionally a
+    follow-on action so an invoice/email problem never prevents the crew from
+    completing the stop.
     """
-    mark_job_completed(
-        int(
-            job_id
-        )
+    job_id = int(
+        job_id
     )
+
+    mark_job_completed(
+        job_id
+    )
+
+    try:
+        return create_invoice_for_completed_dispatch_job(
+            job_id,
+            send_if_enabled=True,
+        )
+    except Exception as exc:
+        return {
+            "created": False,
+            "sent": False,
+            "reason": "invoice_error",
+            "error": str(exc),
+        }
 
 
 # ==========================================================
@@ -971,12 +994,58 @@ def render_stop_card(
                         )
                     else:
                         try:
-                            mark_completed(
+                            invoice_result = mark_completed(
                                 job_id
                             )
+
                             st.success(
                                 f"{customer} completed."
                             )
+
+                            reason = str(
+                                invoice_result.get(
+                                    "reason",
+                                    "",
+                                )
+                                or ""
+                            )
+
+                            if invoice_result.get(
+                                "sent"
+                            ):
+                                st.success(
+                                    "Invoice created and emailed."
+                                )
+
+                            elif reason == "auto_send_disabled":
+                                st.info(
+                                    "Invoice created as Draft. "
+                                    "Automatic sending is currently off."
+                                )
+
+                            elif reason == "missing_email":
+                                st.warning(
+                                    "Invoice created as Draft, but the "
+                                    "customer has no email address."
+                                )
+
+                            elif reason == "nonpositive_total":
+                                st.warning(
+                                    "Invoice created as Draft, but the "
+                                    "customer price needs review."
+                                )
+
+                            elif reason == "already_invoiced":
+                                st.info(
+                                    "This stop was already invoiced."
+                                )
+
+                            elif reason == "invoice_error":
+                                st.warning(
+                                    "The stop was completed, but the invoice "
+                                    "could not be created automatically."
+                                )
+
                             st.rerun()
                         except Exception as exc:
                             st.error(
@@ -1151,8 +1220,9 @@ def render_dispatch_selector() -> Optional[int]:
     Allow authorized Field Mode users to pick a saved dispatch when no token
     was supplied.
 
-    This is especially useful during setup/testing. Once email/text dispatch
-    links are in use, crews should normally enter through their tokenized link.
+    Dispatch IDs are used as the actual selectbox values so two routes can
+    never collide just because they share the same crew, date, or route
+    number. Active routes are shown ahead of completed routes.
     """
     df = active_dispatches()
 
@@ -1161,74 +1231,113 @@ def render_dispatch_selector() -> Optional[int]:
 
     display = df.copy()
 
-    if (
-        "crew_name"
-        not in display.columns
+    for column in (
+        "crew_name",
+        "dispatch_date",
+        "route_number",
+        "status",
     ):
-        display[
-            "crew_name"
-        ] = ""
+        if column not in display.columns:
+            display[column] = ""
 
-    if (
-        "dispatch_date"
-        not in display.columns
-    ):
-        display[
-            "dispatch_date"
-        ] = ""
+    display["_status_text"] = (
+        display["status"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
 
-    if (
-        "route_number"
-        not in display.columns
-    ):
-        display[
-            "route_number"
-        ] = ""
+    status_priority = {
+        "ready": 0,
+        "queued": 0,
+        "pending": 0,
+        "in_progress": 1,
+        "sent": 1,
+        "completed": 2,
+    }
 
-    display[
-        "_label"
-    ] = display.apply(
-        lambda row: (
+    display["_status_priority"] = (
+        display["_status_text"]
+        .map(status_priority)
+        .fillna(1)
+    )
+
+    display = display.sort_values(
+        by=[
+            "_status_priority",
+            "dispatch_date",
+            "route_number",
+            "id",
+        ],
+        ascending=[
+            True,
+            False,
+            True,
+            False,
+        ],
+    )
+
+    labels = {}
+
+    for _, row in display.iterrows():
+        try:
+            dispatch_id = int(
+                row.get(
+                    "id"
+                )
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            continue
+
+        status_text = (
+            _text(
+                row.get(
+                    "status"
+                )
+            )
+            or "Unknown"
+        )
+
+        labels[
+            dispatch_id
+        ] = (
             f"{_text(row.get('dispatch_date'))}"
             f" — "
             f"{_text(row.get('crew_name')) or 'Unassigned Crew'}"
             f" — Route "
             f"{_text(row.get('route_number')) or '?'}"
-        ),
-        axis=1,
+            f" — {status_text.title()}"
+            f" — Dispatch #{dispatch_id}"
+        )
+
+    options = list(
+        labels.keys()
     )
 
-    options = (
-        display[
-            "_label"
-        ].tolist()
-    )
-
-    selected = st.selectbox(
-        "Select Crew Dispatch",
-        options=options,
-        key="field_dispatch_selector",
-    )
-
-    row = display[
-        display[
-            "_label"
-        ]
-        == selected
-    ]
-
-    if row.empty:
+    if not options:
         return None
 
-    dispatch_id = row.iloc[
-        0
-    ].get(
-        "id"
+    selected_dispatch_id = (
+        st.selectbox(
+            "Select Crew Dispatch",
+            options=options,
+            format_func=lambda dispatch_id: (
+                labels.get(
+                    dispatch_id,
+                    f"Dispatch #{dispatch_id}",
+                )
+            ),
+            key="field_dispatch_selector",
+        )
     )
 
     try:
         return int(
-            dispatch_id
+            selected_dispatch_id
         )
     except (
         TypeError,

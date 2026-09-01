@@ -849,8 +849,117 @@ with tab_customers:
                     "Residential"
                 )
 
+            current_standard_schedule = (
+                selected_customer.get(
+                    "standard_schedule",
+                    1,
+                )
+            )
+
+            if pd.isna(
+                current_standard_schedule
+            ):
+                current_standard_schedule = 1
+
+            current_standard_schedule = bool(
+                int(
+                    current_standard_schedule
+                )
+            )
+
+            # Older/newly-created customers may have only the combined
+            # `address` field populated. Build edit-form defaults from that
+            # combined address when the structured address columns are blank.
+            edit_street_address = safe_text(
+                selected_customer.get(
+                    "street_address"
+                )
+            )
+            edit_city = safe_text(
+                selected_customer.get(
+                    "city"
+                )
+            )
+            edit_state = safe_text(
+                selected_customer.get(
+                    "state"
+                )
+            )
+            edit_zip = safe_text(
+                selected_customer.get(
+                    "zip"
+                )
+            )
+
+            full_saved_address = safe_text(
+                selected_customer.get(
+                    "address"
+                )
+            )
+
+            if (
+                full_saved_address
+                and not (
+                    edit_street_address
+                    or edit_city
+                    or edit_state
+                    or edit_zip
+                )
+            ):
+                address_parts = [
+                    part.strip()
+                    for part in full_saved_address.split(
+                        ","
+                    )
+                    if part.strip()
+                ]
+
+                if len(address_parts) >= 3:
+                    edit_street_address = (
+                        address_parts[0]
+                    )
+                    edit_city = (
+                        address_parts[1]
+                    )
+
+                    state_zip_part = (
+                        " ".join(
+                            address_parts[2:]
+                        ).strip()
+                    )
+                    state_zip_tokens = (
+                        state_zip_part.split()
+                    )
+
+                    if state_zip_tokens:
+                        edit_state = (
+                            state_zip_tokens[0]
+                        )
+
+                    if len(
+                        state_zip_tokens
+                    ) > 1:
+                        edit_zip = (
+                            " ".join(
+                                state_zip_tokens[1:]
+                            )
+                        )
+
+                elif len(address_parts) == 2:
+                    edit_street_address = (
+                        address_parts[0]
+                    )
+                    edit_city = (
+                        address_parts[1]
+                    )
+
+                else:
+                    edit_street_address = (
+                        full_saved_address
+                    )
+
             with st.form(
-                "edit_customer_form"
+                f"edit_customer_form_{int(edit_customer_id)}"
             ):
                 edit_1, edit_2, edit_3 = (
                     st.columns(
@@ -913,11 +1022,7 @@ with tab_customers:
                 street_address = (
                     st.text_input(
                         "Street Address",
-                        value=safe_text(
-                            selected_customer.get(
-                                "street_address"
-                            )
-                        ),
+                        value=edit_street_address,
                     )
                 )
 
@@ -930,33 +1035,21 @@ with tab_customers:
                 city = (
                     city_col.text_input(
                         "City",
-                        value=safe_text(
-                            selected_customer.get(
-                                "city"
-                            )
-                        ),
+                        value=edit_city,
                     )
                 )
 
                 state = (
                     state_col.text_input(
                         "State",
-                        value=safe_text(
-                            selected_customer.get(
-                                "state"
-                            )
-                        ),
+                        value=edit_state,
                     )
                 )
 
                 zipcode = (
                     zip_col.text_input(
                         "ZIP",
-                        value=safe_text(
-                            selected_customer.get(
-                                "zip"
-                            )
-                        ),
+                        value=edit_zip,
                     )
                 )
 
@@ -1098,14 +1191,39 @@ with tab_customers:
                     )
                 )
 
+                status_col, schedule_col = (
+                    st.columns(
+                        2
+                    )
+                )
+
                 active = (
-                    st.checkbox(
+                    status_col.checkbox(
                         "Active Customer",
                         value=bool(
                             selected_customer.get(
                                 "active",
                                 1,
                             )
+                        ),
+                        help=(
+                            "Inactive customers do not receive new "
+                            "Standard Schedule events."
+                        ),
+                    )
+                )
+
+                standard_schedule = (
+                    schedule_col.checkbox(
+                        "Standard Schedule",
+                        value=(
+                            current_standard_schedule
+                        ),
+                        help=(
+                            "When enabled, the CRM automatically creates "
+                            "future Standard Schedule treatments for this "
+                            "active customer. Past treatments are not "
+                            "backfilled."
                         ),
                     )
                 )
@@ -1189,6 +1307,9 @@ with tab_customers:
                                 active=int(
                                     active
                                 ),
+                                standard_schedule=int(
+                                    standard_schedule
+                                ),
                             )
 
                         except Exception as exc:
@@ -1245,6 +1366,18 @@ with tab_customers:
                 )
             )
 
+            new_standard_schedule = (
+                st.checkbox(
+                    "Standard Schedule",
+                    value=True,
+                    help=(
+                        "Recommended for regular customers. The CRM will "
+                        "create only Standard Schedule treatments occurring "
+                        "after today; earlier treatments are not backfilled."
+                    ),
+                )
+            )
+
             add_customer_submit = (
                 st.form_submit_button(
                     "Add Customer",
@@ -1271,6 +1404,9 @@ with tab_customers:
                         account_name=(
                             new_account.strip()
                             or None
+                        ),
+                        standard_schedule=(
+                            new_standard_schedule
                         ),
                     )
 
@@ -2013,11 +2149,86 @@ with tab_schedule:
         queue_treatment_events_for_date,
     )
 
-    candidates = (
-        build_treatment_schedule_candidates(
-            schedule_date
+    customer_search = (
+        st.text_input(
+            "Customer Search",
+            value="",
+            placeholder=(
+                "Try John, Smith, Joh, or 123 Oak"
+            ),
+            key="schedule_customer_search",
         )
     )
+
+    search_text = (
+        customer_search.strip().lower()
+    )
+
+    search_terms = [
+        term
+        for term in search_text.split()
+        if term
+    ]
+
+    candidates = (
+        build_treatment_schedule_candidates(
+            schedule_date,
+            include_future=bool(
+                search_terms
+            ),
+        )
+    )
+
+    def schedule_search_match(
+        item
+    ):
+        searchable_text = " ".join(
+            [
+                safe_text(
+                    item.get(
+                        "name"
+                    )
+                ),
+                safe_text(
+                    item.get(
+                        "address"
+                    )
+                ),
+                safe_text(
+                    item.get(
+                        "customer_number"
+                    )
+                ),
+                safe_text(
+                    item.get(
+                        "account_name"
+                    )
+                ),
+            ]
+        ).lower()
+
+        return all(
+            term in searchable_text
+            for term in search_terms
+        )
+
+    displayed_candidates = (
+        candidates
+        if not search_terms
+        else [
+            item
+            for item in candidates
+            if schedule_search_match(
+                item
+            )
+        ]
+    )
+
+    if search_terms:
+        st.caption(
+            f"Showing {len(displayed_candidates)} matching planned "
+            f"treatment(s), including future treatments."
+        )
 
     due_count = len(
         candidates
@@ -2058,10 +2269,10 @@ with tab_schedule:
         ready_count,
     )
 
-    if candidates:
+    if displayed_candidates:
         schedule_rows = (
             pd.DataFrame(
-                candidates
+                displayed_candidates
             )
         )
 
@@ -2242,10 +2453,15 @@ with tab_schedule:
             st.rerun()
 
     else:
-        st.info(
-            "No planned treatments are due by this date. "
-            "Generate the seasonal schedule from Treatments first."
-        )
+        if candidates and search_terms:
+            st.info(
+                "No scheduling candidates match that customer search."
+            )
+        else:
+            st.info(
+                "No planned treatments are due by this date. "
+                "Generate the seasonal schedule from Treatments first."
+            )
 
     st.divider()
 
@@ -2769,6 +2985,60 @@ with tab_settings:
     st.header(
         "Settings"
     )
+
+    st.subheader(
+        "Automatic Invoicing"
+    )
+
+    auto_send_value = str(
+        get_setting(
+            "auto_send_invoices",
+            "false",
+        )
+        or "false"
+    ).strip().lower()
+
+    auto_send_enabled = (
+        auto_send_value
+        in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    )
+
+    new_auto_send_enabled = (
+        st.toggle(
+            "Automatically send invoices when jobs are completed",
+            value=auto_send_enabled,
+            help=(
+                "When enabled, completing a dispatch stop creates the "
+                "invoice and emails it automatically. If the customer has "
+                "no email address or the invoice amount needs review, the "
+                "invoice remains Draft and is not sent."
+            ),
+            key="settings_auto_send_invoices",
+        )
+    )
+
+    if new_auto_send_enabled != auto_send_enabled:
+        set_setting(
+            "auto_send_invoices",
+            "true" if new_auto_send_enabled else "false",
+        )
+        st.success(
+            "Automatic invoice sending is now "
+            + ("ON." if new_auto_send_enabled else "OFF.")
+        )
+
+    st.caption(
+        "Invoice creation still occurs when a stop is completed. "
+        "This switch controls whether eligible invoices are emailed "
+        "automatically."
+    )
+
+    st.divider()
 
     st.subheader(
         "Database"

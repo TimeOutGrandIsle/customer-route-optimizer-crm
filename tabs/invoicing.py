@@ -14,6 +14,7 @@ from core.invoicing import (
     get_invoices,
     get_payments,
     get_ready_to_invoice,
+    send_invoice_email,
     update_invoice_status,
 )
 
@@ -223,15 +224,124 @@ def render() -> None:
                 invoices["id"] == selected_invoice_id
             ].iloc[0]
 
+            delivery_status = str(
+                selected.get("delivery_status") or ""
+            ).strip()
+
+            delivery_error = str(
+                selected.get("delivery_error") or ""
+            ).strip()
+
+            sent_at = str(
+                selected.get("sent_at") or ""
+            ).strip()
+
+            recipient_email = str(
+                selected.get("email") or ""
+            ).strip()
+
             st.markdown(
                 f"""
                 **Invoice:** {selected['invoice_number']}  
                 **Customer:** {selected['customer_name']}  
+                **Email:** {recipient_email or 'No email on file'}  
                 **Status:** {selected['status']}  
                 **Total:** ${float(selected['total'] or 0):,.2f}  
                 **Balance:** ${float(selected['balance'] or 0):,.2f}
                 """
             )
+
+            st.subheader("Email Delivery")
+
+            if delivery_status:
+                if delivery_status == "Delivered to SMTP":
+                    st.success(
+                        f"Delivery status: {delivery_status}"
+                    )
+                elif delivery_status == "Failed":
+                    st.error(
+                        f"Delivery status: {delivery_status}"
+                    )
+                else:
+                    st.warning(
+                        f"Delivery status: {delivery_status}"
+                    )
+            else:
+                st.info(
+                    "Delivery status: Not sent yet."
+                )
+
+            if sent_at:
+                st.caption(
+                    f"Sent at: {sent_at}"
+                )
+
+            if delivery_error:
+                st.error(
+                    f"Delivery details: {delivery_error}"
+                )
+
+            can_send_email = (
+                str(selected["status"]).strip().lower()
+                not in {
+                    "paid",
+                    "void",
+                }
+            )
+
+            if st.button(
+                "Send / Retry Invoice Email",
+                type="primary",
+                use_container_width=True,
+                disabled=not can_send_email,
+                key=f"send_invoice_email_{selected_invoice_id}",
+            ):
+                try:
+                    delivery = send_invoice_email(
+                        int(selected_invoice_id)
+                    )
+
+                except Exception as exc:
+                    st.error(
+                        f"Invoice email failed: {exc}"
+                    )
+
+                else:
+                    if delivery.get("sent"):
+                        recipient = (
+                            delivery.get("recipient")
+                            or recipient_email
+                        )
+
+                        st.success(
+                            f"Invoice emailed to {recipient}."
+                        )
+
+                    elif (
+                        delivery.get("reason")
+                        == "missing_email"
+                    ):
+                        st.warning(
+                            "Invoice was not sent because "
+                            "the customer has no email address."
+                        )
+
+                    elif (
+                        delivery.get("reason")
+                        == "nonpositive_total"
+                    ):
+                        st.warning(
+                            "Invoice was not sent because "
+                            "the invoice total is zero."
+                        )
+
+                    else:
+                        st.warning(
+                            "Invoice was not sent. "
+                            "Review the delivery status below."
+                        )
+
+                    st.rerun()
 
             lines = get_invoice_lines(selected_invoice_id)
 

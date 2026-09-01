@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -14,6 +15,28 @@ import streamlit as st
 import hashlib
 
 from data.postgres_compat import connect
+
+# ---------------------------------------------------------
+# LOCAL TIME
+# ---------------------------------------------------------
+
+CENTRAL_TIME_ZONE = ZoneInfo("America/Chicago")
+
+
+def central_timestamp_text() -> str:
+    """
+    Return the current Time Out Lawncare field timestamp in Central Time.
+
+    America/Chicago automatically handles CST/CDT daylight-saving changes.
+    The dispatch arrival/completion columns are TEXT, so the timestamp is
+    stored as a local wall-clock value for consistent Field Mode display.
+    """
+    return datetime.now(
+        CENTRAL_TIME_ZONE
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
 
 # ---------------------------------------------------------
 # DATABASE CONNECTION
@@ -3087,6 +3110,11 @@ def init_extended_schema():
         "account_name",
         "TEXT",
     )
+    _add_column_if_missing(
+        "customers",
+        "standard_schedule",
+        "INTEGER DEFAULT 1",
+    )
 
     # Dispatch field-status / assignment fields.
     for name, definition in {
@@ -3109,6 +3137,14 @@ def init_extended_schema():
         SET customer_type='Residential'
         WHERE customer_type IS NULL
            OR TRIM(customer_type)=''
+        """
+    )
+
+    execute(
+        """
+        UPDATE customers
+        SET standard_schedule=1
+        WHERE standard_schedule IS NULL
         """
     )
 
@@ -3207,6 +3243,7 @@ def add_customer(
     last_service=None,
     customer_type="Residential",
     account_name=None,
+    standard_schedule=1,
 ):
     """Add a customer while remaining compatible with legacy callers."""
     if not name or not str(name).strip():
@@ -3237,6 +3274,7 @@ def add_customer(
                 name,
                 account_name,
                 customer_type,
+                standard_schedule,
                 address,
                 street_address,
                 city,
@@ -3264,7 +3302,7 @@ def add_customer(
             VALUES (
                 ?,?,?,?,?,?,?,?,?,?,
                 ?,?,?,?,?,?,?,?,?,?,
-                ?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?
             )
             """,
             (
@@ -3272,6 +3310,7 @@ def add_customer(
                 str(name).strip(),
                 account_name,
                 customer_type,
+                int(bool(standard_schedule)),
                 address,
                 street_address,
                 city,
@@ -3664,21 +3703,26 @@ def mark_dispatch_sent(
 def mark_job_arrived(
     job_id: int,
 ):
+    central_time = central_timestamp_text()
+
     execute(
         """
         UPDATE dispatch_jobs
         SET status='in_progress',
-            arrived_time=CURRENT_TIMESTAMP
+            arrived_time=?
         WHERE id=?
         """,
-        (int(job_id),),
+        (
+            central_time,
+            int(job_id),
+        ),
     )
 
     execute(
         """
         UPDATE dispatches
         SET status='in_progress',
-            started_at=COALESCE(started_at, CURRENT_TIMESTAMP),
+            started_at=COALESCE(started_at, ?),
             updated=CURRENT_TIMESTAMP
         WHERE id=(
             SELECT dispatch_id
@@ -3686,21 +3730,29 @@ def mark_job_arrived(
             WHERE id=?
         )
         """,
-        (int(job_id),),
+        (
+            central_time,
+            int(job_id),
+        ),
     )
 
 
 def mark_job_completed(
     job_id: int,
 ):
+    central_time = central_timestamp_text()
+
     execute(
         """
         UPDATE dispatch_jobs
         SET status='completed',
-            completed_time=CURRENT_TIMESTAMP
+            completed_time=?
         WHERE id=?
         """,
-        (int(job_id),),
+        (
+            central_time,
+            int(job_id),
+        ),
     )
 
     conn = get_connection()
@@ -3730,11 +3782,14 @@ def mark_job_completed(
                     """
                     UPDATE dispatches
                     SET status='completed',
-                        completed_at=CURRENT_TIMESTAMP,
+                        completed_at=?,
                         updated=CURRENT_TIMESTAMP
                     WHERE id=?
                     """,
-                    (int(dispatch_id),),
+                    (
+                        central_time,
+                        int(dispatch_id),
+                    ),
                 )
                 conn.commit()
     finally:
