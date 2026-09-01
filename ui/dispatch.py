@@ -1444,6 +1444,152 @@ def clear_saved_dispatch(
     )
 
 
+
+def reassign_saved_dispatch(
+    dispatch_id: int,
+    crew_id: int,
+) -> None:
+    """
+    Reassign every unfinished stop on a saved dispatch to another crew.
+    Completed stops remain untouched.
+    """
+    manifest = get_dispatch_jobs_for_manifest(
+        int(dispatch_id)
+    )
+
+    if manifest is None or manifest.empty:
+        return
+
+    execute(
+        """
+        UPDATE dispatch_jobs
+        SET crew_id=?
+        WHERE dispatch_id=?
+          AND status NOT IN ('completed', 'cancelled', 'canceled')
+        """,
+        (
+            int(crew_id),
+            int(dispatch_id),
+        ),
+    )
+
+    execute(
+        """
+        UPDATE dispatches
+        SET crew_id=?
+        WHERE id=?
+        """,
+        (
+            int(crew_id),
+            int(dispatch_id),
+        ),
+    )
+
+
+def remove_stops_from_saved_dispatch(
+    dispatch_id: int,
+    job_ids: Sequence[int],
+) -> int:
+    """
+    Remove selected unfinished stops from a saved dispatch and return them
+    to the general queue. Completed stops are never changed.
+    """
+    wanted = {
+        int(job_id)
+        for job_id in job_ids
+    }
+
+    if not wanted:
+        return 0
+
+    manifest = get_dispatch_jobs_for_manifest(
+        int(dispatch_id)
+    )
+
+    if manifest is None or manifest.empty:
+        return 0
+
+    changed = 0
+
+    for _, row in manifest.iterrows():
+        job_id = row.get("id")
+
+        if job_id is None:
+            job_id = row.get("job_id")
+
+        if job_id is None:
+            continue
+
+        job_id = int(job_id)
+
+        if job_id not in wanted:
+            continue
+
+        status = _normalize_status(
+            row.get("status")
+        )
+
+        if status in CLOSED_JOB_STATUSES:
+            continue
+
+        queue_dispatch_job(
+            job_id
+        )
+        changed += 1
+
+    return changed
+
+
+def cancel_saved_dispatch(
+    dispatch_id: int,
+) -> int:
+    """
+    Cancel every unfinished stop in a saved dispatch.
+
+    Completed stops remain completed. Planned treatment links are released so
+    the cancelled work is not treated as completed or invoiced.
+    """
+    manifest = get_dispatch_jobs_for_manifest(
+        int(dispatch_id)
+    )
+
+    if manifest is None or manifest.empty:
+        clear_dispatch_manifest(
+            int(dispatch_id),
+            requeue_unfinished=False,
+        )
+        return 0
+
+    cancelled = 0
+
+    for _, row in manifest.iterrows():
+        job_id = row.get("id")
+
+        if job_id is None:
+            job_id = row.get("job_id")
+
+        if job_id is None:
+            continue
+
+        status = _normalize_status(
+            row.get("status")
+        )
+
+        if status in CLOSED_JOB_STATUSES:
+            continue
+
+        mark_job_cancelled(
+            int(job_id)
+        )
+        cancelled += 1
+
+    clear_dispatch_manifest(
+        int(dispatch_id),
+        requeue_unfinished=False,
+    )
+
+    return cancelled
+
 # ==========================================================
 # DRIVER VIEW
 # ==========================================================
@@ -1778,6 +1924,9 @@ def dispatch_dashboard(
 # ==========================================================
 
 __all__ = [
+    "remove_stops_from_saved_dispatch",
+    "reassign_saved_dispatch",
+    "cancel_saved_dispatch",
     "add_to_queue",
     "build_daily_route",
     "build_dispatch_dataframe",

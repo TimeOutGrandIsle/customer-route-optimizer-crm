@@ -382,7 +382,11 @@ def queue_treatment_events_for_date(
                 ~customer_events[
                     "dispatch_status"
                 ].fillna("").isin(
-                    ["queued", "in_progress"]
+                    [
+                        "queued",
+                        "dispatched",
+                        "in_progress",
+                    ]
                 )
             ]
 
@@ -400,10 +404,7 @@ def queue_treatment_events_for_date(
                 FROM dispatch_jobs
                 WHERE customer_id=?
                   AND scheduled_date=?
-                  AND status IN (
-                      'queued',
-                      'in_progress'
-                  )
+                  AND status='queued'
                 ORDER BY id
                 LIMIT 1
                 """,
