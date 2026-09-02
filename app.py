@@ -1702,17 +1702,134 @@ with tab_dispatch:
             if column in saved_df.columns
         ]
 
-        st.dataframe(
-            saved_df[saved_columns],
-            use_container_width=True,
-            hide_index=True,
+        status_series = (
+            saved_df.get(
+                "status",
+                pd.Series(
+                    "",
+                    index=saved_df.index,
+                ),
+            )
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.lower()
         )
+
+        active_mask = ~status_series.isin(
+            [
+                "completed",
+                "cancelled",
+                "canceled",
+            ]
+        )
+
+        completed_mask = status_series.eq(
+            "completed"
+        )
+
+        saved_dates = pd.to_datetime(
+            saved_df.get(
+                "completed_at",
+                saved_df.get(
+                    "dispatch_date",
+                    pd.Series(
+                        pd.NaT,
+                        index=saved_df.index,
+                    ),
+                ),
+            ),
+            errors="coerce",
+            utc=True,
+        )
+
+        recent_cutoff = (
+            pd.Timestamp.now(tz="UTC").normalize()
+            - pd.Timedelta(days=30)
+        )
+
+        recent_completed_mask = (
+            completed_mask
+            & saved_dates.ge(
+                recent_cutoff
+            )
+        )
+
+        history_mask = (
+            ~active_mask
+            & ~recent_completed_mask
+        )
+
+        active_df = saved_df[
+            active_mask
+        ].copy()
+
+        recent_completed_df = saved_df[
+            recent_completed_mask
+        ].copy()
+
+        history_df = saved_df[
+            history_mask
+        ].copy()
+
+        st.markdown(
+            "#### Active Dispatches"
+        )
+
+        if active_df.empty:
+            st.info(
+                "No active saved crew dispatches."
+            )
+        else:
+            st.dataframe(
+                active_df[saved_columns],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown(
+            "#### Recent Completed — Last 30 Days"
+        )
+
+        if recent_completed_df.empty:
+            st.caption(
+                "No completed dispatches in the last 30 days."
+            )
+        else:
+            recent_completed_df = (
+                recent_completed_df.assign(
+                    _sort_date=pd.to_datetime(
+                        recent_completed_df.get(
+                            "completed_at",
+                            recent_completed_df.get(
+                                "dispatch_date"
+                            ),
+                        ),
+                        errors="coerce",
+                    )
+                )
+                .sort_values(
+                    "_sort_date",
+                    ascending=False,
+                )
+                .drop(
+                    columns=["_sort_date"]
+                )
+            )
+
+            st.dataframe(
+                recent_completed_df[
+                    saved_columns
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
         st.markdown(
             "#### Manage Saved Dispatch"
         )
 
-        manageable = saved_df.copy()
+        manageable = active_df.copy()
 
         if "status" in manageable.columns:
             normalized_saved_status = (
@@ -2013,6 +2130,231 @@ with tab_dispatch:
                         "dispatch_preview_routes"
                     ] = []
                     st.rerun()
+
+
+        with st.expander(
+            "Dispatch History",
+            expanded=False,
+        ):
+            st.caption(
+                "Older completed and cancelled dispatches are retained here. "
+                "Search by customer, crew, date, status, route, or dispatch number."
+            )
+
+            history_search = st.text_input(
+                "Search Dispatch History",
+                placeholder=(
+                    "Customer, crew, date, status, route, or dispatch #"
+                ),
+                key="dispatch_history_search",
+            )
+
+            filtered_history = history_df.copy()
+
+            if not filtered_history.empty:
+                history_dates = pd.to_datetime(
+                    filtered_history.get(
+                        "completed_at",
+                        filtered_history.get(
+                            "dispatch_date"
+                        ),
+                    ),
+                    errors="coerce",
+                )
+
+                valid_history_dates = (
+                    history_dates.dropna()
+                )
+
+                if not valid_history_dates.empty:
+                    min_history_date = (
+                        valid_history_dates.min().date()
+                    )
+                    max_history_date = (
+                        valid_history_dates.max().date()
+                    )
+
+                    history_date_range = st.date_input(
+                        "History Date Range",
+                        value=(
+                            min_history_date,
+                            max_history_date,
+                        ),
+                        min_value=min_history_date,
+                        max_value=max_history_date,
+                        key="dispatch_history_date_range",
+                    )
+
+                    if (
+                        isinstance(
+                            history_date_range,
+                            (tuple, list),
+                        )
+                        and len(
+                            history_date_range
+                        ) == 2
+                    ):
+                        start_history_date = (
+                            history_date_range[0]
+                        )
+                        end_history_date = (
+                            history_date_range[1]
+                        )
+
+                        date_values = pd.to_datetime(
+                            filtered_history.get(
+                                "completed_at",
+                                filtered_history.get(
+                                    "dispatch_date"
+                                ),
+                            ),
+                            errors="coerce",
+                        )
+
+                        filtered_history = (
+                            filtered_history[
+                                date_values.dt.date.between(
+                                    start_history_date,
+                                    end_history_date,
+                                )
+                            ].copy()
+                        )
+
+                search_text = (
+                    safe_text(
+                        history_search
+                    )
+                    .strip()
+                    .lower()
+                )
+
+                if search_text:
+                    matching_ids = []
+
+                    for _, history_row in (
+                        filtered_history.iterrows()
+                    ):
+                        dispatch_id = int(
+                            history_row["id"]
+                        )
+
+                        searchable_parts = [
+                            safe_text(
+                                history_row.get(
+                                    "dispatch_date"
+                                )
+                            ),
+                            safe_text(
+                                history_row.get(
+                                    "crew_name"
+                                )
+                            ),
+                            safe_text(
+                                history_row.get(
+                                    "route_number"
+                                )
+                            ),
+                            safe_text(
+                                history_row.get(
+                                    "status"
+                                )
+                            ),
+                            str(dispatch_id),
+                            f"dispatch {dispatch_id}",
+                        ]
+
+                        row_haystack = " ".join(
+                            searchable_parts
+                        ).lower()
+
+                        if search_text in row_haystack:
+                            matching_ids.append(
+                                dispatch_id
+                            )
+                            continue
+
+                        manifest = (
+                            get_saved_dispatch_manifest(
+                                dispatch_id
+                            )
+                        )
+
+                        customer_haystack = " ".join(
+                            " ".join(
+                                [
+                                    safe_text(
+                                        stop.get(
+                                            "name"
+                                        )
+                                    ),
+                                    safe_text(
+                                        stop.get(
+                                            "customer_name"
+                                        )
+                                    ),
+                                    safe_text(
+                                        stop.get(
+                                            "address"
+                                        )
+                                    ),
+                                ]
+                            )
+                            for stop in manifest
+                        ).lower()
+
+                        if search_text in customer_haystack:
+                            matching_ids.append(
+                                dispatch_id
+                            )
+
+                    filtered_history = (
+                        filtered_history[
+                            filtered_history["id"]
+                            .astype(int)
+                            .isin(
+                                matching_ids
+                            )
+                        ].copy()
+                    )
+
+                if filtered_history.empty:
+                    st.info(
+                        "No dispatch history matches those filters."
+                    )
+                else:
+                    filtered_history = (
+                        filtered_history.assign(
+                            _sort_date=pd.to_datetime(
+                                filtered_history.get(
+                                    "completed_at",
+                                    filtered_history.get(
+                                        "dispatch_date"
+                                    ),
+                                ),
+                                errors="coerce",
+                            )
+                        )
+                        .sort_values(
+                            "_sort_date",
+                            ascending=False,
+                        )
+                        .drop(
+                            columns=["_sort_date"]
+                        )
+                    )
+
+                    st.dataframe(
+                        filtered_history[
+                            saved_columns
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+            else:
+                st.caption(
+                    "No older dispatch history yet."
+                )
+
 
     else:
         st.info(
