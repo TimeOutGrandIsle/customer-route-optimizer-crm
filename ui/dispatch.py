@@ -31,6 +31,8 @@ from data.database import (
     assign_job_to_dispatch,
     clear_dispatch_manifest,
     create_dispatch,
+    central_timestamp_text,
+    dataframe,
     execute,
     get_crews,
     get_dispatch,
@@ -73,6 +75,7 @@ CLOSED_JOB_STATUSES = {
     "completed",
     "cancelled",
     "canceled",
+    "rescheduled",
 }
 
 
@@ -1540,52 +1543,349 @@ def remove_stops_from_saved_dispatch(
     return changed
 
 
+def _ensure_dispatch_reschedule_history_table() -> None:
+    """
+    Store immutable snapshots of stops removed from saved dispatches by
+    rescheduling. This preserves the original Dispatch #/Job #/old date
+    without duplicating the live queued dispatch job.
+    """
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS dispatch_reschedule_history (
+            dispatch_id INTEGER NOT NULL,
+            job_id INTEGER NOT NULL,
+            customer_id INTEGER,
+            customer_name TEXT,
+            address TEXT,
+            treatment_name TEXT,
+            old_scheduled_date TEXT,
+            new_scheduled_date TEXT,
+            old_stop_number INTEGER,
+            status TEXT NOT NULL DEFAULT 'rescheduled',
+            rescheduled_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (dispatch_id, job_id, rescheduled_at)
+        )
+        """
+    )
+
+
+def get_dispatch_reschedule_history(
+    dispatch_id: int | None = None,
+) -> List[Dict[str, Any]]:
+    """
+    Return historical stop snapshots created when saved-dispatch stops
+    were rescheduled.
+    """
+    _ensure_dispatch_reschedule_history_table()
+
+    if dispatch_id is None:
+        df = dataframe(
+            """
+            SELECT *
+            FROM dispatch_reschedule_history
+            ORDER BY rescheduled_at DESC
+            """
+        )
+    else:
+        df = dataframe(
+            """
+            SELECT *
+            FROM dispatch_reschedule_history
+            WHERE dispatch_id=?
+            ORDER BY rescheduled_at DESC
+            """,
+            (int(dispatch_id),),
+        )
+
+    if df is None or df.empty:
+        return []
+
+    return df.to_dict("records")
+
+
+def _snapshot_rescheduled_dispatch_stop(
+    dispatch_id: int,
+    job_id: int,
+    stop: Mapping[str, Any] | None,
+    old_date: str,
+    new_date: str,
+) -> None:
+    """
+    Save the original route assignment before the live job is detached.
+    """
+    _ensure_dispatch_reschedule_history_table()
+    stop = dict(stop or {})
+
+    customer_name = (
+        stop.get("name")
+        or stop.get("customer_name")
+        or ""
+    )
+    address = (
+        stop.get("address")
+        or stop.get("street_address")
+        or ""
+    )
+    treatment_name = (
+        stop.get("treatment_name")
+        or stop.get("service_name")
+        or stop.get("service")
+        or ""
+    )
+
+    execute(
+        """
+        INSERT INTO dispatch_reschedule_history (
+            dispatch_id,
+            job_id,
+            customer_id,
+            customer_name,
+            address,
+            treatment_name,
+            old_scheduled_date,
+            new_scheduled_date,
+            old_stop_number,
+            status,
+            rescheduled_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'rescheduled', CURRENT_TIMESTAMP)
+        """,
+        (
+            int(dispatch_id),
+            int(job_id),
+            stop.get("customer_id"),
+            str(customer_name),
+            str(address),
+            str(treatment_name),
+            old_date,
+            new_date,
+            stop.get("stop_number"),
+        ),
+    )
+
+
+
+def reschedule_dispatch_job(
+    job_id: int,
+    new_date: date | datetime | str,
+    *,
+    return_to_queue: bool = False,
+    dispatch_id: int | None = None,
+) -> None:
+    """
+    Reschedule an existing dispatch job without creating a duplicate.
+
+    For a saved crew dispatch, pass dispatch_id explicitly. A historical
+    snapshot is written first. The live Job # is then detached from the
+    old Dispatch # and returned
+    to the queue for the new date. If the old Dispatch # has no unfinished
+    stops left, it is preserved as status='rescheduled' and moves to
+    Dispatch History rather than being deleted.
+    """
+    job_id = int(job_id)
+    normalized_date = _normalize_date(new_date)
+
+    manifest_row = None
+    parent_dispatch_id = (
+        int(dispatch_id)
+        if dispatch_id is not None
+        else None
+    )
+    old_scheduled_date = ""
+
+    # Capture the saved-dispatch relationship before queue_dispatch_job()
+    # clears dispatch_id/crew/route/stop assignment.
+    try:
+        rows = get_all_dispatch_jobs()
+        for row in rows:
+            if int(row.get("id") or 0) == job_id:
+                manifest_row = row
+                if parent_dispatch_id is None:
+                    parent_dispatch_id = row.get("dispatch_id")
+                old_scheduled_date = _normalize_date(
+                    row.get("scheduled_date")
+                )
+                break
+    except Exception:
+        manifest_row = None
+
+    if return_to_queue and parent_dispatch_id is not None:
+        # Prefer the richer saved manifest row for the history snapshot.
+        try:
+            saved_manifest = get_dispatch_jobs_for_manifest(
+                int(parent_dispatch_id)
+            )
+            if saved_manifest is not None and not saved_manifest.empty:
+                matching = saved_manifest[
+                    saved_manifest["id"].astype(int) == job_id
+                ]
+                if not matching.empty:
+                    manifest_row = matching.iloc[0].to_dict()
+                    old_scheduled_date = _normalize_date(
+                        manifest_row.get("scheduled_date")
+                    )
+        except Exception:
+            pass
+
+        _snapshot_rescheduled_dispatch_stop(
+            int(parent_dispatch_id),
+            job_id,
+            manifest_row,
+            old_scheduled_date,
+            normalized_date,
+        )
+
+        queue_dispatch_job(job_id)
+
+    execute(
+        """
+        UPDATE dispatch_jobs
+        SET scheduled_date=?
+        WHERE id=?
+          AND LOWER(COALESCE(status,'')) NOT IN (
+              'completed','cancelled','canceled'
+          )
+        """,
+        (normalized_date, job_id),
+    )
+
+    # Keep Scheduling and Dispatch aligned for the linked planned treatment.
+    execute(
+        """
+        UPDATE treatment_events
+        SET due_date=?
+        WHERE dispatch_job_id=?
+          AND LOWER(COALESCE(status,''))='planned'
+        """,
+        (normalized_date, job_id),
+    )
+
+    if return_to_queue and parent_dispatch_id is not None:
+        remaining = get_dispatch_jobs_for_manifest(
+            int(parent_dispatch_id)
+        )
+
+        if remaining is None or remaining.empty:
+            # Preserve the old Dispatch # as historical evidence of the
+            # rescheduled route instead of deleting it.
+            execute(
+                """
+                UPDATE dispatches
+                SET status='rescheduled',
+                    completed_at=COALESCE(
+                        completed_at, ?
+                    ),
+                    updated=?
+                WHERE id=?
+                """,
+                (
+                    central_timestamp_text(),
+                    central_timestamp_text(),
+                    int(parent_dispatch_id),
+                ),
+            )
+        else:
+            statuses = (
+                remaining.get("status", pd.Series(dtype=str))
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+            )
+            active_count = int(
+                (~statuses.isin(CLOSED_JOB_STATUSES)).sum()
+            )
+
+            if active_count == 0:
+                if statuses.eq("completed").any():
+                    execute(
+                        """
+                        UPDATE dispatches
+                        SET status='completed',
+                            completed_at=COALESCE(
+                                completed_at, ?
+                            ),
+                            updated=?
+                        WHERE id=?
+                        """,
+                        (
+                            central_timestamp_text(),
+                            central_timestamp_text(),
+                            int(parent_dispatch_id),
+                        ),
+                    )
+                else:
+                    execute(
+                        """
+                        UPDATE dispatches
+                        SET status='rescheduled',
+                            completed_at=COALESCE(
+                                completed_at, ?
+                            ),
+                            updated=?
+                        WHERE id=?
+                        """,
+                        (
+                            central_timestamp_text(),
+                            central_timestamp_text(),
+                            int(parent_dispatch_id),
+                        ),
+                    )
+
+
 def cancel_saved_dispatch(
     dispatch_id: int,
 ) -> int:
     """
-    Cancel every unfinished stop in a saved dispatch.
+    Cancel every unfinished stop while preserving the saved dispatch for history.
 
-    Completed stops remain completed. Planned treatment links are released so
-    the cancelled work is not treated as completed or invoiced.
+    Completed stops remain completed. Unfinished stops are marked cancelled and
+    planned treatment links are released. The parent dispatch and its manifest
+    stay intact so the cancelled route remains available in Dispatch History.
     """
-    manifest = get_dispatch_jobs_for_manifest(
-        int(dispatch_id)
-    )
+    dispatch_id = int(dispatch_id)
 
-    if manifest is None or manifest.empty:
-        clear_dispatch_manifest(
-            int(dispatch_id),
-            requeue_unfinished=False,
-        )
-        return 0
+    manifest = get_dispatch_jobs_for_manifest(
+        dispatch_id
+    )
 
     cancelled = 0
 
-    for _, row in manifest.iterrows():
-        job_id = row.get("id")
+    if manifest is not None and not manifest.empty:
+        for _, row in manifest.iterrows():
+            job_id = row.get("id")
 
-        if job_id is None:
-            job_id = row.get("job_id")
+            if job_id is None:
+                job_id = row.get("job_id")
 
-        if job_id is None:
-            continue
+            if job_id is None:
+                continue
 
-        status = _normalize_status(
-            row.get("status")
-        )
+            status = _normalize_status(
+                row.get("status")
+            )
 
-        if status in CLOSED_JOB_STATUSES:
-            continue
+            if status in CLOSED_JOB_STATUSES:
+                continue
 
-        mark_job_cancelled(
-            int(job_id)
-        )
-        cancelled += 1
+            mark_job_cancelled(
+                int(job_id)
+            )
+            cancelled += 1
 
-    clear_dispatch_manifest(
-        int(dispatch_id),
-        requeue_unfinished=False,
+    execute(
+        """
+        UPDATE dispatches
+        SET status='cancelled',
+            completed_at=COALESCE(completed_at, ?),
+            updated=?
+        WHERE id=?
+        """,
+        (
+            central_timestamp_text(),
+            central_timestamp_text(),
+            dispatch_id,
+        ),
     )
 
     return cancelled
@@ -1951,6 +2251,7 @@ __all__ = [
     "get_driver_route_view",
     "get_saved_dispatch_manifest",
     "get_saved_dispatches",
+    "get_dispatch_reschedule_history",
     "mark_dispatch_as_sent",
     "mark_job_cancelled",
     "mark_job_complete",
@@ -1959,4 +2260,5 @@ __all__ = [
     "release_linked_treatments",
     "remaining_stops",
     "requeue_job",
+    "reschedule_dispatch_job",
 ]

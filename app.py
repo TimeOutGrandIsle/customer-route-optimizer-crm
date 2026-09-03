@@ -23,8 +23,11 @@ Business rules implemented here:
 
 from __future__ import annotations
 
+import smtplib
+import ssl
 import traceback
 from datetime import date, datetime
+from email.message import EmailMessage
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -56,13 +59,121 @@ from ui.dispatch import (
     cancel_saved_dispatch,
     clear_saved_dispatch,
     create_multi_crew_dispatch,
+    crew_dispatch_link,
     dispatch_dashboard,
     get_saved_dispatch_manifest,
     get_saved_dispatches,
+    get_dispatch_reschedule_history,
+    mark_dispatch_as_sent,
     mark_job_in_progress,
     reassign_saved_dispatch,
     remove_stops_from_saved_dispatch,
+    reschedule_dispatch_job,
 )
+
+
+def send_crew_dispatch_email(
+    recipient: str,
+    dispatch_id: int,
+    crew_name: str,
+    dispatch_date_value: str,
+    field_link: str,
+    manifest: List[Dict[str, Any]],
+) -> None:
+    """
+    Send a saved crew dispatch using the existing [email] SMTP secrets.
+    """
+    email_cfg = st.secrets.get("email", {})
+    smtp_server = str(
+        email_cfg.get("smtp_server", "smtp.gmail.com")
+    ).strip()
+    smtp_port = int(
+        email_cfg.get("smtp_port", 587)
+    )
+    username = str(
+        email_cfg.get("username", "")
+    ).strip()
+    password = str(
+        email_cfg.get("password", "")
+    ).strip()
+    from_name = str(
+        email_cfg.get("from_name", "Time Out Lawncare")
+    ).strip()
+
+    if not username or not password:
+        raise RuntimeError(
+            "Email SMTP settings are not configured."
+        )
+
+    stop_lines = []
+    for index, stop in enumerate(manifest, start=1):
+        customer = (
+            safe_text(stop.get("name"))
+            or safe_text(stop.get("customer_name"))
+            or f"Stop {index}"
+        )
+        address = safe_text(stop.get("address"))
+        treatment = (
+            safe_text(stop.get("treatment_name"))
+            or safe_text(stop.get("service"))
+        )
+        job_id = stop.get("id") or stop.get("job_id")
+
+        parts = [f"{index}. {customer}"]
+        if address:
+            parts.append(address)
+        if treatment:
+            parts.append(treatment)
+        if job_id:
+            parts.append(f"Job #{int(job_id)}")
+        stop_lines.append(" — ".join(parts))
+
+    message = EmailMessage()
+    message["Subject"] = (
+        f"Time Out Lawncare Dispatch #{int(dispatch_id)}"
+        f" — {dispatch_date_value}"
+    )
+    message["From"] = (
+        f"{from_name} <{username}>"
+        if from_name
+        else username
+    )
+    message["To"] = recipient
+
+    message.set_content(
+        "\n".join(
+            [
+                f"Crew: {crew_name}",
+                f"Dispatch #{int(dispatch_id)}",
+                f"Date: {dispatch_date_value}",
+                "",
+                "Open Field Mode:",
+                field_link,
+                "",
+                "Stops:",
+                *stop_lines,
+            ]
+        )
+    )
+
+    context = ssl.create_default_context()
+
+    # Preserve certificate verification while avoiding the Python 3.14
+    # strict-X509 incompatibility previously encountered with Gmail SMTP.
+    if hasattr(ssl, "VERIFY_X509_STRICT"):
+        context.verify_flags &= ~ssl.VERIFY_X509_STRICT
+
+    with smtplib.SMTP(
+        smtp_server,
+        smtp_port,
+        timeout=30,
+    ) as server:
+        server.ehlo()
+        server.starttls(context=context)
+        server.ehlo()
+        server.login(username, password)
+        server.send_message(message)
+
 
 
 # ==========================================================
@@ -333,6 +444,28 @@ def load_float_setting(
         )
 
 
+
+def load_bool_setting(
+    setting_key: str,
+    fallback: bool = False,
+) -> bool:
+    try:
+        value = get_setting(
+            setting_key,
+            "1" if fallback else "0",
+        )
+    except Exception:
+        return bool(fallback)
+
+    return str(value or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "enabled",
+    }
+
+
 def get_live_customers() -> pd.DataFrame:
     try:
         return list_customers()
@@ -377,9 +510,45 @@ st.title(
 
 stats = get_dashboard_stats()
 
-header_1, header_2, header_3, header_4 = (
+# Saved crew dispatches are persistent routes and are separate from the
+# live queued-job dashboard. Load them here so active saved routes are
+# visible in the office header and Dashboard as soon as they are created.
+try:
+    header_saved_dispatches = get_saved_dispatches() or []
+except Exception:
+    header_saved_dispatches = []
+
+header_saved_df = pd.DataFrame(header_saved_dispatches)
+
+if header_saved_df.empty:
+    active_saved_df = pd.DataFrame()
+else:
+    header_status = (
+        header_saved_df.get(
+            "status",
+            pd.Series("", index=header_saved_df.index),
+        )
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    active_saved_df = header_saved_df[
+        ~header_status.isin(
+            [
+                "completed",
+                "cancelled",
+                "canceled",
+                "rescheduled",
+            ]
+        )
+    ].copy()
+
+active_saved_count = len(active_saved_df)
+
+header_1, header_2, header_3, header_4, header_5 = (
     st.columns(
-        4
+        5
     )
 )
 
@@ -400,6 +569,11 @@ header_2.metric(
 )
 
 header_3.metric(
+    "Active Dispatches",
+    active_saved_count,
+)
+
+header_4.metric(
     "Completed",
     stats.get(
         "completed_jobs",
@@ -407,7 +581,7 @@ header_3.metric(
     ),
 )
 
-header_4.metric(
+header_5.metric(
     "Commercial",
     (
         stats.get(
@@ -481,9 +655,9 @@ with tab_dashboard:
         )
     )
 
-    dash_1, dash_2, dash_3, dash_4 = (
+    dash_1, dash_2, dash_3, dash_4, dash_5 = (
         st.columns(
-            4
+            5
         )
     )
 
@@ -499,14 +673,19 @@ with tab_dashboard:
     )
 
     dash_2.metric(
-        "Dispatched",
+        "Active Dispatches",
+        active_saved_count,
+    )
+
+    dash_3.metric(
+        "Dispatched Stops",
         dashboard_stats.get(
             "dispatched",
             0,
         ),
     )
 
-    dash_3.metric(
+    dash_4.metric(
         "In Progress",
         dashboard_stats.get(
             "in_progress",
@@ -514,7 +693,7 @@ with tab_dashboard:
         ),
     )
 
-    dash_4.metric(
+    dash_5.metric(
         "Completed",
         dashboard_stats.get(
             "completed",
@@ -542,7 +721,52 @@ with tab_dashboard:
     st.divider()
 
     st.subheader(
-        "Current Route Summary"
+        "Active Crew Dispatches"
+    )
+
+    if active_saved_df.empty:
+        st.info(
+            "No active saved crew dispatches."
+        )
+    else:
+        active_dashboard_columns = [
+            column
+            for column in (
+                "id",
+                "dispatch_date",
+                "crew_name",
+                "route_number",
+                "status",
+                "stop_count",
+                "completed_count",
+            )
+            if column in active_saved_df.columns
+        ]
+
+        active_dashboard_display = (
+            active_saved_df[active_dashboard_columns]
+            .copy()
+        )
+
+        st.dataframe(
+            active_dashboard_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "id": "Dispatch #",
+                "dispatch_date": "Dispatch Date",
+                "crew_name": "Crew",
+                "route_number": "Route",
+                "status": "Status",
+                "stop_count": "Stops",
+                "completed_count": "Completed",
+            },
+        )
+
+    st.divider()
+
+    st.subheader(
+        "Dispatch-Ready Route Preview"
     )
 
     summary = dispatch.get(
@@ -1115,6 +1339,25 @@ with tab_customers:
                     )
                 )
 
+                auto_email_invoices = (
+                    st.checkbox(
+                        "Automatically Email Invoices",
+                        value=load_bool_setting(
+                            (
+                                "auto_email_customer_"
+                                f"{int(edit_customer_id)}"
+                            ),
+                            True,
+                        ),
+                        help=(
+                            "When the company-wide auto-send setting is ON, "
+                            "completed-job invoices for this customer are "
+                            "emailed automatically. Turn this OFF to create "
+                            "the invoice as a Draft without emailing it."
+                        ),
+                    )
+                )
+
                 save_customer = (
                     st.form_submit_button(
                         "Save Customer Changes",
@@ -1202,6 +1445,17 @@ with tab_customers:
                                 f"{exc}"
                             )
                         else:
+                            set_setting(
+                                (
+                                    "auto_email_customer_"
+                                    f"{int(edit_customer_id)}"
+                                ),
+                                (
+                                    "1"
+                                    if auto_email_invoices
+                                    else "0"
+                                ),
+                            )
                             st.success(
                                 "Customer updated successfully."
                             )
@@ -1250,6 +1504,18 @@ with tab_customers:
                 )
             )
 
+            new_auto_email_invoices = (
+                st.checkbox(
+                    "Automatically Email Invoices",
+                    value=True,
+                    help=(
+                        "Turn this OFF if this customer's invoices should "
+                        "be created as Drafts instead of being emailed "
+                        "automatically."
+                    ),
+                )
+            )
+
             add_customer_submit = (
                 st.form_submit_button(
                     "Add Customer",
@@ -1260,7 +1526,7 @@ with tab_customers:
 
             if add_customer_submit:
                 try:
-                    create_customer(
+                    new_customer_id = create_customer(
                         name=(
                             new_name
                         ),
@@ -1278,6 +1544,19 @@ with tab_customers:
                             or None
                         ),
                     )
+
+                    if new_customer_id is not None:
+                        set_setting(
+                            (
+                                "auto_email_customer_"
+                                f"{int(new_customer_id)}"
+                            ),
+                            (
+                                "1"
+                                if new_auto_email_invoices
+                                else "0"
+                            ),
+                        )
 
                 except Exception as exc:
                     st.error(
@@ -1401,6 +1680,80 @@ with tab_dispatch:
         st.info(
             "There are no queued jobs."
         )
+
+    if queued_jobs:
+        with st.expander(
+            "Postpone / Reschedule Queued Job",
+            expanded=False,
+        ):
+            queued_labels = {}
+            queued_by_id = {}
+
+            for job in queued_jobs:
+                job_id = int(job.get("id"))
+                queued_by_id[job_id] = job
+                customer_name = (
+                    safe_text(job.get("name"))
+                    or safe_text(job.get("customer_name"))
+                    or f"Job #{job_id}"
+                )
+                treatment = (
+                    safe_text(job.get("treatment_name"))
+                    or safe_text(job.get("service"))
+                )
+                scheduled = safe_text(job.get("scheduled_date"))
+                parts = [customer_name]
+                if treatment:
+                    parts.append(treatment)
+                if scheduled:
+                    parts.append(f"Currently {scheduled}")
+                parts.append(f"Job #{job_id}")
+                queued_labels[job_id] = " — ".join(parts)
+
+            reschedule_queue_job_id = st.selectbox(
+                "Queued Job",
+                options=list(queued_labels),
+                format_func=lambda value: queued_labels[value],
+                key="reschedule_queued_job_id",
+            )
+
+            selected_queue_job = queued_by_id[
+                int(reschedule_queue_job_id)
+            ]
+
+            try:
+                current_queue_date = pd.to_datetime(
+                    selected_queue_job.get("scheduled_date"),
+                    errors="coerce",
+                )
+                if pd.isna(current_queue_date):
+                    current_queue_date = date.today()
+                else:
+                    current_queue_date = current_queue_date.date()
+            except Exception:
+                current_queue_date = date.today()
+
+            new_queue_date = st.date_input(
+                "New Scheduled Date",
+                value=current_queue_date,
+                key="reschedule_queued_new_date",
+            )
+
+            if st.button(
+                "Reschedule Job",
+                type="primary",
+                use_container_width=True,
+                key="reschedule_queued_job_button",
+            ):
+                reschedule_dispatch_job(
+                    int(reschedule_queue_job_id),
+                    new_queue_date,
+                    return_to_queue=False,
+                )
+                st.success(
+                    f"Job moved to {new_queue_date:%B %d, %Y}."
+                )
+                st.rerun()
 
     st.divider()
 
@@ -1721,6 +2074,7 @@ with tab_dispatch:
                 "completed",
                 "cancelled",
                 "canceled",
+                "rescheduled",
             ]
         )
 
@@ -1785,6 +2139,15 @@ with tab_dispatch:
                 active_df[saved_columns],
                 use_container_width=True,
                 hide_index=True,
+                column_config={
+                    "id": "Dispatch #",
+                    "dispatch_date": "Dispatch Date",
+                    "crew_name": "Crew",
+                    "route_number": "Route",
+                    "status": "Status",
+                    "stop_count": "Stops",
+                    "completed_count": "Completed",
+                },
             )
 
         st.markdown(
@@ -1823,6 +2186,15 @@ with tab_dispatch:
                 ],
                 use_container_width=True,
                 hide_index=True,
+                column_config={
+                    "id": "Dispatch #",
+                    "dispatch_date": "Dispatch Date",
+                    "crew_name": "Crew",
+                    "route_number": "Route",
+                    "status": "Status",
+                    "stop_count": "Stops",
+                    "completed_count": "Completed",
+                },
             )
 
         st.markdown(
@@ -1845,6 +2217,7 @@ with tab_dispatch:
                         "completed",
                         "cancelled",
                         "canceled",
+                        "rescheduled",
                     ]
                 )
             ].copy()
@@ -1888,6 +2261,34 @@ with tab_dispatch:
                     )
                 )
 
+            def _clear_saved_dispatch_management_state(
+                clear_dispatch_selection=False,
+            ):
+                """
+                Clear widget state that belongs to the previously managed
+                saved dispatch so selections/confirmations never carry
+                over to another Dispatch #.
+                """
+                state_keys = [
+                    "saved_dispatch_new_crew",
+                    "saved_dispatch_remove_stops",
+                    "reschedule_saved_job_id",
+                    "reschedule_saved_new_date",
+                    "confirm_cancel_saved_dispatch",
+                ]
+
+                for state_key in state_keys:
+                    st.session_state.pop(
+                        state_key,
+                        None,
+                    )
+
+                if clear_dispatch_selection:
+                    st.session_state.pop(
+                        "manage_saved_dispatch_id",
+                        None,
+                    )
+
             selected_saved_dispatch_id = st.selectbox(
                 "Saved Dispatch",
                 options=list(dispatch_labels),
@@ -1895,6 +2296,13 @@ with tab_dispatch:
                     dispatch_labels[value]
                 ),
                 key="manage_saved_dispatch_id",
+                on_change=(
+                    _clear_saved_dispatch_management_state
+                ),
+            )
+
+            st.caption(
+                f"Managing Dispatch #{int(selected_saved_dispatch_id)}"
             )
 
             selected_manifest = (
@@ -1905,10 +2313,141 @@ with tab_dispatch:
                 )
             )
 
+            selected_saved_row = manageable[
+                manageable["id"].astype(int)
+                == int(selected_saved_dispatch_id)
+            ]
+
+            if not selected_saved_row.empty:
+                selected_saved_record = (
+                    selected_saved_row.iloc[0].to_dict()
+                )
+            else:
+                selected_saved_record = {}
+
+            crew_id_value = selected_saved_record.get(
+                "crew_id"
+            )
+            crew_name_value = (
+                safe_text(
+                    selected_saved_record.get(
+                        "crew_name"
+                    )
+                )
+                or "Crew"
+            )
+            dispatch_date_value = safe_text(
+                selected_saved_record.get(
+                    "dispatch_date"
+                )
+            )
+
+            crew_email = ""
+            if crew_id_value is not None:
+                try:
+                    all_crews_for_email = get_crews(
+                        active_only=False
+                    )
+                    if (
+                        all_crews_for_email is not None
+                        and not all_crews_for_email.empty
+                    ):
+                        crew_match = all_crews_for_email[
+                            all_crews_for_email["id"].astype(int)
+                            == int(crew_id_value)
+                        ]
+                        if not crew_match.empty:
+                            crew_email = safe_text(
+                                crew_match.iloc[0].get(
+                                    "email"
+                                )
+                            ).strip()
+                except Exception:
+                    crew_email = ""
+
+            app_base_url = str(
+                st.secrets.get(
+                    "APP_BASE_URL",
+                    "https://timeout-lawncare-crm.streamlit.app",
+                )
+            ).strip()
+
+            field_link = crew_dispatch_link(
+                int(selected_saved_dispatch_id),
+                app_base_url,
+            )
+
+            email_col, link_col = st.columns(2)
+
+            email_disabled = (
+                not crew_email
+                or not field_link
+                or not selected_manifest
+            )
+
+            if email_col.button(
+                (
+                    f"Email Dispatch #{int(selected_saved_dispatch_id)} "
+                    f"to {crew_name_value}"
+                ),
+                use_container_width=True,
+                disabled=email_disabled,
+                key=(
+                    "email_saved_dispatch_"
+                    f"{int(selected_saved_dispatch_id)}"
+                ),
+            ):
+                try:
+                    send_crew_dispatch_email(
+                        recipient=crew_email,
+                        dispatch_id=int(
+                            selected_saved_dispatch_id
+                        ),
+                        crew_name=crew_name_value,
+                        dispatch_date_value=(
+                            dispatch_date_value
+                        ),
+                        field_link=field_link,
+                        manifest=selected_manifest,
+                    )
+                    mark_dispatch_as_sent(
+                        int(
+                            selected_saved_dispatch_id
+                        )
+                    )
+                    st.success(
+                        f"Dispatch #{int(selected_saved_dispatch_id)} "
+                        f"emailed to {crew_email}."
+                    )
+                except Exception:
+                    st.error(
+                        "The dispatch email could not be sent."
+                    )
+                    st.exception(
+                        traceback.format_exc()
+                    )
+
+            if field_link:
+                link_col.link_button(
+                    (
+                        f"Open Dispatch #{int(selected_saved_dispatch_id)} "
+                        "Crew Link"
+                    ),
+                    field_link,
+                    use_container_width=True,
+                )
+
+            if not crew_email:
+                st.caption(
+                    "Add an email address for this crew in Settings "
+                    "to enable dispatch email."
+                )
+
             management_tabs = st.tabs(
                 [
                     "Reassign Crew",
                     "Edit Stops",
+                    "Postpone / Reschedule",
                     "Return to Queue",
                     "Cancel Dispatch",
                 ]
@@ -1965,6 +2504,7 @@ with tab_dispatch:
                             "Unfinished stops reassigned to "
                             f"{reassign_labels[new_crew_id]}."
                         )
+                        _clear_saved_dispatch_management_state()
                         st.rerun()
 
             with management_tabs[1]:
@@ -2016,7 +2556,9 @@ with tab_dispatch:
                         )
 
                         stop_labels[job_id] = (
-                            f"{customer_name}"
+                            f"Dispatch #{int(selected_saved_dispatch_id)}"
+                            f" — Job #{job_id}"
+                            f" — {customer_name}"
                             + (
                                 f" — {address}"
                                 if address
@@ -2062,9 +2604,116 @@ with tab_dispatch:
                             f"{'' if changed == 1 else 's'} "
                             "returned to the queue."
                         )
+                        _clear_saved_dispatch_management_state()
                         st.rerun()
 
             with management_tabs[2]:
+                unfinished_for_reschedule = [
+                    stop
+                    for stop in selected_manifest
+                    if safe_text(stop.get("status")).strip().lower()
+                    not in {
+                        "completed",
+                        "cancelled",
+                        "canceled",
+                    }
+                ]
+
+                if not unfinished_for_reschedule:
+                    st.info(
+                        "This dispatch has no unfinished stops to reschedule."
+                    )
+                else:
+                    reschedule_saved_labels = {}
+                    reschedule_saved_by_id = {}
+
+                    for stop in unfinished_for_reschedule:
+                        job_id = stop.get("id") or stop.get("job_id")
+                        if job_id is None:
+                            continue
+                        job_id = int(job_id)
+                        reschedule_saved_by_id[job_id] = stop
+                        customer_name = (
+                            safe_text(stop.get("name"))
+                            or safe_text(stop.get("customer_name"))
+                            or f"Job #{job_id}"
+                        )
+                        treatment = (
+                            safe_text(stop.get("treatment_name"))
+                            or safe_text(stop.get("service_name"))
+                            or safe_text(stop.get("service"))
+                        )
+                        scheduled = safe_text(stop.get("scheduled_date"))
+                        parts = [customer_name]
+                        if treatment:
+                            parts.append(treatment)
+                        if scheduled:
+                            parts.append(f"Currently {scheduled}")
+                        parts.append(
+                            f"Dispatch #{int(selected_saved_dispatch_id)}"
+                        )
+                        parts.append(f"Job #{job_id}")
+                        reschedule_saved_labels[job_id] = " — ".join(parts)
+
+                    saved_job_to_reschedule = st.selectbox(
+                        "Dispatch Stop",
+                        options=list(reschedule_saved_labels),
+                        format_func=lambda value: (
+                            reschedule_saved_labels[value]
+                        ),
+                        key="reschedule_saved_job_id",
+                    )
+
+                    saved_stop = reschedule_saved_by_id[
+                        int(saved_job_to_reschedule)
+                    ]
+
+                    try:
+                        current_saved_date = pd.to_datetime(
+                            saved_stop.get("scheduled_date"),
+                            errors="coerce",
+                        )
+                        if pd.isna(current_saved_date):
+                            current_saved_date = date.today()
+                        else:
+                            current_saved_date = current_saved_date.date()
+                    except Exception:
+                        current_saved_date = date.today()
+
+                    new_saved_date = st.date_input(
+                        "New Scheduled Date",
+                        value=current_saved_date,
+                        key="reschedule_saved_new_date",
+                    )
+
+                    st.caption(
+                        "This removes the stop from the saved crew route, "
+                        "keeps the same job and treatment link, and returns "
+                        "it to the Dispatch queue for the new date."
+                    )
+
+                    if st.button(
+                        "Postpone / Reschedule Stop",
+                        type="primary",
+                        use_container_width=True,
+                        key="reschedule_saved_job_button",
+                    ):
+                        reschedule_dispatch_job(
+                            int(saved_job_to_reschedule),
+                            new_saved_date,
+                            return_to_queue=True,
+                            dispatch_id=int(
+                                selected_saved_dispatch_id
+                            ),
+                        )
+                        st.success(
+                            "Stop returned to the queue for "
+                            f"{new_saved_date:%B %d, %Y}."
+                        )
+                        _clear_saved_dispatch_management_state()
+                        st.rerun()
+
+            with management_tabs[3]:
                 st.caption(
                     "Dissolve this saved route and return every "
                     "unfinished stop to the general Dispatch queue. "
@@ -2089,9 +2738,12 @@ with tab_dispatch:
                     st.session_state[
                         "dispatch_preview_routes"
                     ] = []
+                    _clear_saved_dispatch_management_state(
+                        clear_dispatch_selection=True,
+                    )
                     st.rerun()
 
-            with management_tabs[3]:
+            with management_tabs[4]:
                 st.warning(
                     "Cancel Dispatch removes all unfinished stops "
                     "from Dispatch. They will NOT return to the queue. "
@@ -2129,6 +2781,9 @@ with tab_dispatch:
                     st.session_state[
                         "dispatch_preview_routes"
                     ] = []
+                    _clear_saved_dispatch_management_state(
+                        clear_dispatch_selection=True,
+                    )
                     st.rerun()
 
 
@@ -2137,7 +2792,7 @@ with tab_dispatch:
             expanded=False,
         ):
             st.caption(
-                "Older completed and cancelled dispatches are retained here. "
+                "Older completed, cancelled, and rescheduled dispatches are retained here. "
                 "Search by customer, crew, date, status, route, or dispatch number."
             )
 
@@ -2180,9 +2835,11 @@ with tab_dispatch:
                             min_history_date,
                             max_history_date,
                         ),
-                        min_value=min_history_date,
-                        max_value=max_history_date,
                         key="dispatch_history_date_range",
+                        help=(
+                            "Choose any start and end dates. The default range "
+                            "covers the history currently stored."
+                        ),
                     )
 
                     if (
@@ -2278,6 +2935,11 @@ with tab_dispatch:
                                 dispatch_id
                             )
                         )
+                        rescheduled_manifest = (
+                            get_dispatch_reschedule_history(
+                                dispatch_id
+                            )
+                        )
 
                         customer_haystack = " ".join(
                             " ".join(
@@ -2299,7 +2961,10 @@ with tab_dispatch:
                                     ),
                                 ]
                             )
-                            for stop in manifest
+                            for stop in (
+                                list(manifest)
+                                + list(rescheduled_manifest)
+                            )
                         ).lower()
 
                         if search_text in customer_haystack:
@@ -2349,7 +3014,73 @@ with tab_dispatch:
                         ],
                         use_container_width=True,
                         hide_index=True,
+                        column_config={
+                            "id": "Dispatch #",
+                            "dispatch_date": "Dispatch Date",
+                            "crew_name": "Crew",
+                            "route_number": "Route",
+                            "status": "Status",
+                            "stop_count": "Stops",
+                            "completed_count": "Completed",
+                        },
                     )
+
+                    visible_history_ids = {
+                        int(value)
+                        for value in filtered_history["id"].tolist()
+                    }
+
+                    rescheduled_stops = [
+                        row
+                        for row in get_dispatch_reschedule_history()
+                        if int(row.get("dispatch_id") or 0)
+                        in visible_history_ids
+                    ]
+
+                    if rescheduled_stops:
+                        st.markdown("#### Rescheduled Stops")
+                        st.caption(
+                            "These are historical snapshots of stops removed "
+                            "from saved dispatches. The live Job # continues "
+                            "in the queue on its new scheduled date."
+                        )
+
+                        rescheduled_df = pd.DataFrame(
+                            rescheduled_stops
+                        )
+
+                        rescheduled_columns = [
+                            column
+                            for column in [
+                                "dispatch_id",
+                                "job_id",
+                                "customer_name",
+                                "treatment_name",
+                                "old_scheduled_date",
+                                "new_scheduled_date",
+                                "status",
+                                "rescheduled_at",
+                            ]
+                            if column in rescheduled_df.columns
+                        ]
+
+                        st.dataframe(
+                            rescheduled_df[
+                                rescheduled_columns
+                            ],
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "dispatch_id": "Dispatch #",
+                                "job_id": "Job #",
+                                "customer_name": "Customer",
+                                "treatment_name": "Treatment",
+                                "old_scheduled_date": "Original Date",
+                                "new_scheduled_date": "Rescheduled Date",
+                                "status": "Status",
+                                "rescheduled_at": "Rescheduled At",
+                            },
+                        )
             else:
                 st.caption(
                     "No older dispatch history yet."
@@ -2661,14 +3392,89 @@ with tab_schedule:
         queue_treatment_events_for_date,
     )
 
-    candidates = (
-        build_treatment_schedule_candidates(
-            schedule_date
+    customer_search = (
+        st.text_input(
+            "Customer Search",
+            value="",
+            placeholder=(
+                "Try John, Smith, Joh, or 123 Oak"
+            ),
+            key="schedule_customer_search",
         )
     )
 
-    due_count = len(
+    search_text = (
+        customer_search.strip().lower()
+    )
+
+    search_terms = [
+        term
+        for term in search_text.split()
+        if term
+    ]
+
+    candidates = (
+        build_treatment_schedule_candidates(
+            schedule_date,
+            include_future=bool(
+                search_terms
+            ),
+        )
+    )
+
+    def schedule_search_match(
+        item
+    ):
+        searchable_text = " ".join(
+            [
+                safe_text(
+                    item.get(
+                        "name"
+                    )
+                ),
+                safe_text(
+                    item.get(
+                        "address"
+                    )
+                ),
+                safe_text(
+                    item.get(
+                        "customer_number"
+                    )
+                ),
+                safe_text(
+                    item.get(
+                        "account_name"
+                    )
+                ),
+            ]
+        ).lower()
+
+        return all(
+            term in searchable_text
+            for term in search_terms
+        )
+
+    displayed_candidates = (
         candidates
+        if not search_terms
+        else [
+            item
+            for item in candidates
+            if schedule_search_match(
+                item
+            )
+        ]
+    )
+
+    if search_terms:
+        st.caption(
+            f"Showing {len(displayed_candidates)} matching planned "
+            f"treatment(s), including future treatments."
+        )
+
+    due_count = len(
+        displayed_candidates
     )
 
     queued_count = sum(
@@ -2677,7 +3483,7 @@ with tab_schedule:
                 "already_queued"
             )
         )
-        for item in candidates
+        for item in displayed_candidates
     )
 
     ready_count = (
@@ -2706,10 +3512,10 @@ with tab_schedule:
         ready_count,
     )
 
-    if candidates:
+    if displayed_candidates:
         schedule_rows = (
             pd.DataFrame(
-                candidates
+                displayed_candidates
             )
         )
 
@@ -2890,10 +3696,15 @@ with tab_schedule:
             st.rerun()
 
     else:
-        st.info(
-            "No planned treatments are due by this date. "
-            "Generate the seasonal schedule from Treatments first."
-        )
+        if candidates and search_terms:
+            st.info(
+                "No scheduling candidates match that customer search."
+            )
+        else:
+            st.info(
+                "No planned treatments are due by this date. "
+                "Generate the seasonal schedule from Treatments first."
+            )
 
     st.divider()
 
@@ -3429,6 +4240,57 @@ with tab_settings:
     st.caption(
         "CRM records are retained independently of Streamlit "
         "restarts, sign-outs, sleeps, and deployments."
+    )
+
+    st.divider()
+
+    st.subheader(
+        "Invoicing"
+    )
+
+    with st.form(
+        "invoice_email_settings_form"
+    ):
+        global_auto_send_invoices = (
+            st.checkbox(
+                "Automatically send invoices when jobs are completed",
+                value=load_bool_setting(
+                    "auto_send_invoices",
+                    False,
+                ),
+                help=(
+                    "When ON, completed-job invoices are emailed "
+                    "automatically unless that customer has opted out. "
+                    "When OFF, invoices are still created as Drafts."
+                ),
+            )
+        )
+
+        save_invoice_email_settings = (
+            st.form_submit_button(
+                "Save Invoice Email Settings",
+                type="primary",
+                use_container_width=True,
+            )
+        )
+
+        if save_invoice_email_settings:
+            set_setting(
+                "auto_send_invoices",
+                (
+                    "1"
+                    if global_auto_send_invoices
+                    else "0"
+                ),
+            )
+            st.success(
+                "Invoice email settings saved."
+            )
+            st.rerun()
+
+    st.caption(
+        "Individual customers can opt out under "
+        "Customers → Edit Customer → Automatically Email Invoices."
     )
 
     st.divider()

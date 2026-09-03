@@ -801,6 +801,18 @@ def create_invoice_for_completed_application(
         result["reason"] = "auto_send_disabled"
         return result
 
+    customer_id = (
+        application.get("customer_id")
+        if "application" in locals()
+        else job.get("customer_id")
+    )
+    if customer_id is not None and not _setting_enabled(
+        f"auto_email_customer_{int(customer_id)}",
+        default=True,
+    ):
+        result["reason"] = "customer_auto_email_disabled"
+        return result
+
     recipient = str(
         application.get("email")
         or ""
@@ -1074,6 +1086,18 @@ def create_invoice_for_completed_dispatch_job(
         default=False,
     ):
         result["reason"] = "auto_send_disabled"
+        return result
+
+    customer_id = (
+        application.get("customer_id")
+        if "application" in locals()
+        else job.get("customer_id")
+    )
+    if customer_id is not None and not _setting_enabled(
+        f"auto_email_customer_{int(customer_id)}",
+        default=True,
+    ):
+        result["reason"] = "customer_auto_email_disabled"
         return result
 
     recipient = str(job.get("email") or "").strip()

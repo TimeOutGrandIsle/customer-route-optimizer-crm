@@ -939,6 +939,32 @@ def render_stop_card(
             stop
         )
 
+        dispatch_id = stop.get(
+            "dispatch_id"
+        )
+
+        id_parts = []
+        if dispatch_id is not None:
+            try:
+                id_parts.append(
+                    f"Dispatch #{int(dispatch_id)}"
+                )
+            except (TypeError, ValueError):
+                pass
+
+        if job_id is not None:
+            try:
+                id_parts.append(
+                    f"Job #{int(job_id)}"
+                )
+            except (TypeError, ValueError):
+                pass
+
+        if id_parts:
+            st.caption(
+                " • ".join(id_parts)
+            )
+
         nav_col, action_col = (
             st.columns(
                 2

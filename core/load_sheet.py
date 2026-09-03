@@ -49,6 +49,7 @@ def build_daily_load_sheet(
         WHERE dj.scheduled_date=?
           AND dj.status IN (
               'queued',
+              'dispatched',
               'in_progress'
           )
         ORDER BY c.name
@@ -91,6 +92,7 @@ def build_daily_load_sheet(
         WHERE dj.scheduled_date=?
           AND dj.status IN (
               'queued',
+              'dispatched',
               'in_progress'
           )
           AND te.status='planned'
@@ -139,6 +141,7 @@ def build_daily_load_sheet(
         WHERE dj.scheduled_date=?
           AND dj.status IN (
               'queued',
+              'dispatched',
               'in_progress'
           )
           AND te.status='planned'
