@@ -1139,6 +1139,26 @@ with tab_customers:
                     )
                 )
 
+                current_full_address = (
+                    safe_text(
+                        selected_customer.get(
+                            "address"
+                        )
+                    )
+                )
+
+                full_address = (
+                    st.text_input(
+                        "Full Address",
+                        value=current_full_address,
+                        help=(
+                            "Edit this field to replace the complete address, "
+                            "or edit the separate address fields below to have "
+                            "the full address rebuilt automatically."
+                        ),
+                    )
+                )
+
                 street_address = (
                     st.text_input(
                         "Street Address",
@@ -1436,6 +1456,18 @@ with tab_customers:
                                 ),
                                 active=int(
                                     active
+                                ),
+                                **(
+                                    {
+                                        "address": (
+                                            full_address.strip()
+                                        )
+                                    }
+                                    if (
+                                        full_address.strip()
+                                        != current_full_address.strip()
+                                    )
+                                    else {}
                                 ),
                             )
 
