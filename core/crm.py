@@ -531,11 +531,22 @@ def edit_customer(
             **kwargs,
         }
 
+        # The stored full address must not override edited address
+        # components.  The customer form submits street/city/state/ZIP but
+        # does not submit ``address``; using the merged record's address here
+        # therefore kept the original full address forever.  Only prefer a
+        # full address when the caller explicitly supplied one.
+        explicit_address = (
+            kwargs.get(
+                "address"
+            )
+            if "address" in kwargs
+            else None
+        )
+
         full_address = (
             _build_customer_address(
-                address=merged.get(
-                    "address"
-                ),
+                address=explicit_address,
                 street_address=merged.get(
                     "street_address"
                 ),
