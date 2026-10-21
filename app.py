@@ -1139,13 +1139,73 @@ with tab_customers:
                     )
                 )
 
-                current_full_address = (
-                    safe_text(
-                        selected_customer.get(
-                            "address"
-                        )
+                stored_full_address = safe_text(
+                    selected_customer.get(
+                        "address"
                     )
                 )
+                stored_street_address = safe_text(
+                    selected_customer.get(
+                        "street_address"
+                    )
+                )
+                stored_city = safe_text(
+                    selected_customer.get(
+                        "city"
+                    )
+                )
+                stored_state = safe_text(
+                    selected_customer.get(
+                        "state"
+                    )
+                )
+                stored_zip = safe_text(
+                    selected_customer.get(
+                        "zip"
+                    )
+                )
+
+                stored_locality = ", ".join(
+                    part
+                    for part in (
+                        stored_city,
+                        stored_state,
+                    )
+                    if part
+                )
+
+                if stored_zip:
+                    stored_locality = (
+                        f"{stored_locality} {stored_zip}"
+                    ).strip()
+
+                assembled_full_address = ", ".join(
+                    part
+                    for part in (
+                        stored_street_address,
+                        stored_locality,
+                    )
+                    if part
+                )
+
+                # Heal blank or street-only legacy addresses from the
+                # component fields, but preserve a richer stored address
+                # that may contain an apartment, suite, or other detail.
+                if (
+                    assembled_full_address
+                    and (
+                        not stored_full_address
+                        or stored_full_address.casefold()
+                        == stored_street_address.casefold()
+                    )
+                ):
+                    current_full_address = (
+                        assembled_full_address
+                    )
+                else:
+                    current_full_address = (
+                        stored_full_address
+                    )
 
                 full_address = (
                     st.text_input(
@@ -1465,7 +1525,7 @@ with tab_customers:
                                     }
                                     if (
                                         full_address.strip()
-                                        != current_full_address.strip()
+                                        != stored_full_address.strip()
                                     )
                                     else {}
                                 ),
