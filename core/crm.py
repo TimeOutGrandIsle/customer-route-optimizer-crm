@@ -512,13 +512,15 @@ def edit_customer(
         "zip",
     }
 
-    address_changed = any(
-        field in kwargs
-        for field
-        in address_fields
-    )
+    supplied_address_fields = [
+        field
+        for field in address_fields
+        if field in kwargs
+    ]
 
-    if address_changed:
+    current = {}
+
+    if supplied_address_fields:
         current = (
             get_customer_record(
                 customer_id
@@ -526,6 +528,21 @@ def edit_customer(
             or {}
         )
 
+    address_changed = any(
+        _clean_optional_text(
+            kwargs.get(
+                field
+            )
+        )
+        != _clean_optional_text(
+            current.get(
+                field
+            )
+        )
+        for field in supplied_address_fields
+    )
+
+    if address_changed:
         merged = {
             **current,
             **kwargs,
